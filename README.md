@@ -22,7 +22,7 @@ To polecenie uruchomi:
 
 ## 🌟 Główne Funkcjonalności
 
-### 1. Symulator Łańcucha Dostaw (Sprint 4)
+### 1. Symulator Łańcucha Dostaw
 Silnik symulacji zdarzeń dyskretnych (Discrete Event Simulation) modelujący rzeczywiste procesy logistyczne.
 *   **Agenty**: Ciężarówki z cyklem życia (IDLE, EN_ROUTE, RESTING).
 *   **Graf**: Topologia sieci z różnymi typami węzłów (Warehouse, Hub, Customer, Port, Inspection).
@@ -37,7 +37,7 @@ Silnik symulacji zdarzeń dyskretnych (Discrete Event Simulation) modelujący rz
     *   Wskaźniki oczekujących zamówień.
     *   Dashboard (HUD) ze statystykami w czasie rzeczywistym.
 
-### 2. Pipeline Danych (Sprint 2-3)
+### 2. Pipeline Danych
 Kompletny proces ETL przygotowujący dane do analizy i uczenia maszynowego.
 *   **Czyszczenie**: Normalizacja typów, usuwanie duplikatów.
 *   **Walidacja (Pandera)**: Sprawdzanie jakości danych (zakresy, typy, braki) zgodnie ze schematem `SupplyChainSchema`.
