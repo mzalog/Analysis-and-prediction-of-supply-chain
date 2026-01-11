@@ -13,6 +13,8 @@ from supply_chain.data.preprocessing import PreprocessingConfig, TabularPreproce
 from supply_chain.data.split import TimeBasedSplitter, TimeSplitConfig
 from supply_chain.data.time_features import TimeFeatureConfig, TimeFeatureEngineer
 from supply_chain.data.validation import DataValidationConfig, DataValidator
+from supply_chain.model.dataset import SupplyChainDataset
+from supply_chain.model.train import train_model
 from supply_chain.schemas import SupplyChainSchema
 from supply_chain.eda.analyzer import EDAConfig, ExploratoryDataAnalyzer
 from supply_chain.logging_config import get_logger, setup_logging
@@ -41,6 +43,12 @@ def parse_args() -> argparse.Namespace:
         "--live",
         action="store_true",
         help="Run the simulation with live visualization.",
+    )
+
+    parser.add_argument(
+        "--train",
+        action="store_true",
+        help="Train the neural network model on the data.",
     )
     
     parser.add_argument(
@@ -106,6 +114,12 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=4,
         help="Number of nearest neighbors for graph edges (default: 4).",
+    )
+    parser.add_argument(
+        "--epochs",
+        type=int,
+        default=10,
+        help="Number of epochs for training (default: 10).",
     )
     return parser.parse_args()
 
@@ -334,6 +348,43 @@ def main() -> None:
         print(corr.head())
     else:
         print("No numeric correlations available.")
+
+
+    if args.train:
+        logger.info("Starting Model Training...")
+        # 1. Prepare data
+        # We need to re-split or use the existing split from above if we want to be consistent
+        # For simplicity, we'll use the preprocessed features_array and split it
+        
+        # NOTE: The TabularPreprocessor returns a numpy array of features. 
+        # We need the target variable separately.
+        
+        # Get target variable
+        y = df_clean[schema.target_column].values
+        
+        # Simple split (using same random state as preprocessor/sampler if possible for reproducibility)
+        from sklearn.model_selection import train_test_split
+        import torch
+        from torch.utils.data import DataLoader
+
+        X_train, X_val, y_train, y_val = train_test_split(features_array, y, test_size=0.2, random_state=42)
+        
+        train_dataset = SupplyChainDataset(X_train, y_train)
+        val_dataset = SupplyChainDataset(X_val, y_val)
+        
+        train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
+        val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False)
+        
+        input_size = X_train.shape[1]
+        
+        models_dir = Path(DataPaths().project_root) / "models"
+        models_dir.mkdir(exist_ok=True)
+        save_path = models_dir / "supply_chain_model.pth"
+        
+        model, metrics = train_model(train_loader, val_loader, input_size, epochs=args.epochs, save_path=save_path)
+        
+        logger.info(f"Training completed. Metrics: {metrics}")
+        logger.info(f"Model saved to {save_path}")
 
 
 if __name__ == "__main__":
