@@ -43,11 +43,17 @@ class TabularPreprocessor:
         return tuple(self._feature_names_out)
 
     def _build_pipeline(self, df: pd.DataFrame) -> ColumnTransformer:
+        # Prevent Data Leakage: Exclude target and retrospective metrics
+        target_col = self._config.schema.target_column
+        leakage_cols = {"delivery_time_deviation", target_col}
+
         numeric_features = [
-            col for col in self._config.schema.get_continuous_features() if col in df.columns
+            col for col in self._config.schema.continuous_features 
+            if col in df.columns and col not in leakage_cols
         ]
         binary_features = [
-            col for col in self._config.schema.get_binary_features() if col in df.columns
+            col for col in self._config.schema.binary_features 
+            if col in df.columns and col not in leakage_cols
         ]
 
         numeric_pipeline = Pipeline(

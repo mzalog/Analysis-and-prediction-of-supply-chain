@@ -171,6 +171,7 @@ class DataConverter:
         order_id = ""
         truck_status = ""
         
+        result = {}
 
         if engine and truck_id and truck_id in engine.trucks:
             truck = engine.trucks[truck_id]
@@ -196,6 +197,18 @@ class DataConverter:
         
 
         
+        # FIX: Define missing factors
+        is_rush_hour = 1 if (7 <= hour_of_day <= 9) or (16 <= hour_of_day <= 18) else 0
+        rush_hour_factor = 0.8 if is_rush_hour else 0.2
+        
+        travel_duration = event.details.get("travel_duration", 0.0) if event.details else 0.0
+        # Normalize travel factor (e.g. assume max travel is ~10 hours = 600 mins)
+        travel_factor = min(1.0, travel_duration / 600.0)
+
+        service_duration = event.details.get("service_duration", 0.0) if event.details else 0.0
+        # Normalize service factor (e.g. max 5 hours = 300 mins)
+        service_factor = min(1.0, service_duration / 300.0)
+
         traffic = calibrator.sample_correlated("traffic_congestion_level", rush_hour_factor)
         
         weather = calibrator.sample("weather_condition_severity")
