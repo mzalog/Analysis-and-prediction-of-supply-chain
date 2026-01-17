@@ -499,14 +499,34 @@ with tabs[1]:
                         with torch.no_grad():
                             prob = model(features_tensor).item()
                             
-                        st.metric("Success Probability", f"{prob*100:.1f}%")
+                        st.metric("Probability of On-Time Arrival", f"{prob*100:.1f}%")
                         
+                        # Calculate ETA Heuristic
+                        try:
+                            # 1. Start Time of current order
+                            start_time = order.creation_time
+                            # 2. Distance remaining? 
+                            # Simplification: Distance from current node to dest
+                            if truck.route and truck.current_node_index < len(truck.route):
+                                # Just calculate straight line distance + small buffer for remaining legs
+                                current_n = gb.nodes[truck.current_node_id]
+                                dest_n = gb.nodes[order.destination_node_id]
+                                from supply_chain.simulation.graph import haversine_distance
+                                dist_km = haversine_distance(current_n.lat, current_n.lon, dest_n.lat, dest_n.lon)
+                                avg_speed = 60.0 # km/h
+                                est_hours = dist_km / avg_speed
+                                eta_sim_time = engine.current_time + (est_hours * 60) # minutes
+                                
+                                st.metric("Estimated Arrival Duration", f"{int(est_hours)}h {int((est_hours%1)*60)}m")
+                        except Exception as calc_err:
+                            st.info(f"ETA Calc unavailable: {calc_err}")
+
                         if prob > 0.8:
-                            st.success("✅ Delivery likely to be ON TIME.")
+                            st.success(f"✅ Likely to arrive within ~{int(est_hours)}h.")
                         elif prob > 0.5:
-                            st.warning("⚠️ Moderate Risk of Delay.")
+                            st.warning("⚠️ Risk of missing the target window.")
                         else:
-                            st.error("🚨 High Risk: Delivery likely DELAYED/FAILED.")
+                            st.error("🚨 High Risk: Likely to be late!")
                             
                     except Exception as e:
                         st.error(f"Prediction error: {e}")
