@@ -83,9 +83,11 @@ def train_gnn():
             print(f"     Epoch {epoch+1}/{epochs} | Loss: {avg_loss:.4f}")
 
     # 5. Save Model
-    output_dir = Path(REPORTS_DIR) / "experiments" / "gnn_model"
+    # Determine project root (assuming src/supply_chain/gnn/train.py)
+    project_root = Path(__file__).resolve().parent.parent.parent.parent
+    output_dir = project_root / "models"
     output_dir.mkdir(parents=True, exist_ok=True)
-    save_path = output_dir / "gnn_model.pth"
+    save_path = output_dir / "supply_chain_gnn.pth"
     torch.save(model.state_dict(), save_path)
     print(f"\n✅ GNN Model Saved to: {save_path}")
 
