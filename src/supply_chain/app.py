@@ -12,6 +12,7 @@ import base64
 from pathlib import Path
 import torch
 import numpy as np
+import pydeck as pdk
 
 # Add src to path so we can import supply_chain package
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -64,7 +65,7 @@ st.markdown("""
 # --- AI Loading ---
 @st.cache_resource
 def load_ai_assets():
-    """Loads the trained model and fits the preprocessor on historical data."""
+    """Loads the trained MLP model and fits the preprocessor on historical data."""
     try:
         experiment_dir = Path(REPORTS_DIR) / "experiments" / "experiment_chaos"
         data_path = experiment_dir / "simulated_data.csv"
@@ -83,7 +84,7 @@ def load_ai_assets():
         # 2. Load Model
         input_size = len(preprocessor.feature_names_out)
         model = SupplyChainNet(input_size)
-        model.load_state_dict(torch.load(model_path))
+        model.load_state_dict(torch.load(model_path, map_location=torch.device('cpu')))
         model.eval()
         
         return model, preprocessor
@@ -91,7 +92,28 @@ def load_ai_assets():
         st.error(f"Failed to load AI assets: {e}")
         return None, None
 
+@st.cache_resource
+def load_gnn_model():
+    """Loads the trained GNN model."""
+    try:
+        from supply_chain.gnn.model import SupplyChainGNN
+        model_path = Path(REPORTS_DIR) / "experiments" / "gnn_model" / "gnn_model.pth"
+        
+        if not model_path.exists():
+            return None
+            
+        # Initialize Architecture (Standard params from train.py)
+        model = SupplyChainGNN(in_channels=5, hidden_channels=64, out_channels=1)
+        model.load_state_dict(torch.load(model_path, map_location=torch.device('cpu')))
+        model.eval()
+        return model
+    except Exception as e:
+        st.error(f"Failed to load GNN Model: {e}")
+        return None
+
 model, preprocessor = load_ai_assets()
+gnn_model = load_gnn_model()
+
 
 # --- Helper Functions ---
 
@@ -167,9 +189,62 @@ def reset_simulation():
         del st.session_state.engine
     init_simulation()
 
-import pydeck as pdk
+def get_current_graph_snapshot(engine, graph_builder):
+    """
+    Extracts current simulation state into a PyG Data object for GNN inference.
+    Fast extraction without pandas overhead.
+    """
+    from torch_geometric.data import Data
+    
+    graph = graph_builder.graph
+    node_mapping = {n: i for i, n in enumerate(graph.nodes())}
+    num_nodes = len(graph.nodes)
+    
+    # 1. Edge Index
+    src, dst = [], []
+    for u, v in graph.edges():
+        if u in node_mapping and v in node_mapping:
+            src.append(node_mapping[u])
+            dst.append(node_mapping[v])
+            src.append(node_mapping[v]) # Undirected for message passing
+            dst.append(node_mapping[u])
+    edge_index = torch.tensor([src, dst], dtype=torch.long)
+    
+    # 2. Node Features [Num_Nodes, 5]
+    # Features: [Type, Load, Traffic, Weather, Delay]
+    x = torch.zeros((num_nodes, 5), dtype=torch.float)
+    
+    # Traffic/Weather from calibrator context (or simplified global state)
+    # Ideally, we should pull from specific node state if engine tracks it physically.
+    # For now, we simulate "local" conditions based on the calibrator or engine internals.
+    
+    for node_id, idx in node_mapping.items():
+        node_data = graph.nodes[node_id]['data']
+        
+        # Feature 0: Type
+        type_val = 0
+        if node_data.type == NodeType.WAREHOUSE: type_val = 1
+        elif node_data.type == NodeType.HUB: type_val = 2
+        elif node_data.type == NodeType.PORT: type_val = 3
+        elif node_data.type == NodeType.CUSTOMER: type_val = 4
+        x[idx, 0] = type_val
+        
+        # Feature 1: Load (Pending Orders at this node)
+        load = sum(1 for o in engine.orders.values() if o.origin_node_id == node_id and o.status == "ASSIGNED")
+        x[idx, 1] = load
+        
+        # Feature 2 & 3: Context (Resampled for demo "live" volatility)
+        if hasattr(st.session_state, 'calibrator'):
+             x[idx, 2] = st.session_state.calibrator.sample("traffic_congestion_level")
+             x[idx, 3] = st.session_state.calibrator.sample("weather_condition_severity")
+        
+        # Feature 4: Current Delays (Avg delay of recent arrivals at this node)
+        x[idx, 4] = 0.0 # Placeholder for live simulation
+        
+    return Data(x=x, edge_index=edge_index)
 
-def render_pydeck_map(engine, graph_builder):
+
+def render_pydeck_map(engine, graph_builder, show_gnn_risk=False):
     """Render the graph using PyDeck."""
     graph = graph_builder.graph
 
@@ -330,6 +405,52 @@ def render_pydeck_map(engine, graph_builder):
             get_pixel_offset=[0, 18]
         )
     ]
+    
+    # --- GNN Visualization Layer ---
+    if show_gnn_risk:
+        if gnn_model:
+            # Inference
+            snapshot = get_current_graph_snapshot(engine, graph_builder)
+            with torch.no_grad():
+                risk_scores = gnn_model(snapshot.x, snapshot.edge_index)
+            
+            gnn_data = []
+            max_risk = risk_scores.max().item()
+            for i, score in enumerate(risk_scores):
+                node_id = list(snapshot.x.size())[0] # Helper only, mapping needed
+                # Reconstruct mapping (Assuming order is preserved from graph.nodes())
+                node_id = list(graph.nodes())[i]
+                node = graph.nodes[node_id]['data']
+                
+                risk_val = score.item()
+                # Color Gradient: Green (0) -> Red (1)
+                r = int(255 * risk_val)
+                g = int(255 * (1 - risk_val))
+                
+                gnn_data.append({
+                    "lon": node.lon,
+                    "lat": node.lat,
+                    "radius": 6000 * risk_val, # Bigger radius = Higher Risk
+                    "color": [r, g, 0, 150], # Semi-transparent
+                    "risk": f"{risk_val:.2f}"
+                })
+                
+            layers.append(pdk.Layer(
+                "ScatterplotLayer",
+                gnn_data,
+                get_position=["lon", "lat"],
+                get_fill_color="color",
+                get_radius="radius",
+                pickable=True,
+                opacity=0.6,
+                stroked=True,
+                filled=True,
+                radius_min_pixels=5,
+                radius_max_pixels=40
+            ))
+        else:
+            # Cannot show warning easily in map renderer, avoiding side effects
+            pass
 
     lats = [n['lat'] for n in nodes_data]
     lons = [n['lon'] for n in nodes_data]
@@ -356,7 +477,7 @@ def render_pydeck_map(engine, graph_builder):
     return pdk.Deck(
         layers=layers,
         initial_view_state=view_state,
-        tooltip={"text": "{id}\n{type}\n{status}"},
+        tooltip={"text": "{id}\n{type}\n{status}\nRisk: {risk}"}, # Added Risk to tooltip
         map_style="mapbox://styles/mapbox/dark-v10"
     )
 
@@ -376,6 +497,10 @@ with st.sidebar.expander("🗺️ Map Legend", expanded=False):
     st.markdown("🟠 **Hub** (Orange)")
     st.markdown("🔵 **Port** (Cyan)")
     st.markdown("🛑 **Inspection** (Pink)")
+    
+    st.markdown("**AI Layers:**")
+    st.markdown("🔴 **Spatial Risk** (Dynamic Red Circles)")
+
 
 graph_source = st.sidebar.radio("Graph Source", ["Random", "TSPLIB File"], index=0)
 st.session_state.graph_source = graph_source
@@ -396,6 +521,7 @@ if st.session_state.last_graph_source != graph_source:
 
 st.session_state.num_trucks = st.sidebar.slider("Number of Trucks", 5, 30, 20)
 sim_speed = st.sidebar.slider("Simulation Speed (steps/frame)", 1, 10, 2)
+show_gnn_risk = st.sidebar.checkbox("👁️ Show AI Spatial Risk (GNN)", value=False)
 
 if st.sidebar.button("Reset Simulation"):
     reset_simulation()
@@ -447,7 +573,7 @@ with tabs[0]:
         c3.metric("Cancelled", len(cancelled))
         c4.metric("Active Trucks", f"{active_trucks}/{len(engine.trucks)}")
         
-        deck = render_pydeck_map(engine, gb)
+        deck = render_pydeck_map(engine, gb, show_gnn_risk)
         if "view_state" in st.session_state:
             deck.initial_view_state = st.session_state.view_state
         else:
