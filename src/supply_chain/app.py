@@ -62,16 +62,23 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# --- AI Loading ---
+    # --- AI Loading ---
 @st.cache_resource
 def load_ai_assets():
     """Loads the trained MLP model and fits the preprocessor on historical data."""
     try:
+        # Data still in experiments folder for fitting preprocessor
         experiment_dir = Path(REPORTS_DIR) / "experiments" / "experiment_chaos"
         data_path = experiment_dir / "simulated_data.csv"
-        model_path = experiment_dir / "model.pth"
+        
+        # Model moved to models/
+        # Adjust path relative to project root or use absolute logic if needed
+        # Assuming app.py is run from project root or src is in path
+        project_root = Path(__file__).parent.parent.parent
+        model_path = project_root / "models" / "supply_chain_mlp.pth"
         
         if not data_path.exists() or not model_path.exists():
+            st.error(f"Missing assets: Data={data_path.exists()}, Model={model_path.exists()}")
             return None, None
             
         # 1. Fit Preprocessor
@@ -97,7 +104,9 @@ def load_gnn_model():
     """Loads the trained GNN model."""
     try:
         from supply_chain.gnn.model import SupplyChainGNN
-        model_path = Path(REPORTS_DIR) / "experiments" / "gnn_model" / "gnn_model.pth"
+        
+        project_root = Path(__file__).parent.parent.parent
+        model_path = project_root / "models" / "supply_chain_gnn.pth"
         
         if not model_path.exists():
             return None
@@ -234,7 +243,14 @@ def get_current_graph_snapshot(engine, graph_builder):
         x[idx, 1] = load
         
         # Feature 2 & 3: Context (Resampled for demo "live" volatility)
-        if hasattr(st.session_state, 'calibrator'):
+        # Check for manual overrides ("Sabotage")
+        overrides = st.session_state.get('node_overrides', {})
+        
+        if node_id in overrides:
+            # User stuck this node!
+            x[idx, 2] = overrides[node_id].get('traffic', 0.5) * 10.0 # Scale to 0-10
+            x[idx, 3] = overrides[node_id].get('weather', 0.5)
+        elif hasattr(st.session_state, 'calibrator'):
              x[idx, 2] = st.session_state.calibrator.sample("traffic_congestion_level")
              x[idx, 3] = st.session_state.calibrator.sample("weather_condition_severity")
         
@@ -523,6 +539,32 @@ st.session_state.num_trucks = st.sidebar.slider("Number of Trucks", 5, 30, 20)
 sim_speed = st.sidebar.slider("Simulation Speed (steps/frame)", 1, 10, 2)
 show_gnn_risk = st.sidebar.checkbox("👁️ Show AI Spatial Risk (GNN)", value=False)
 
+# --- Sabotage Panel ---
+st.sidebar.markdown("---")
+st.sidebar.subheader("🔥 Chaos / Sabotage")
+if 'node_overrides' not in st.session_state:
+    st.session_state.node_overrides = {}
+
+if 'gb' in st.session_state and st.session_state.gb:
+    sabotage_node = st.sidebar.selectbox("Select Node to Sabotage", list(st.session_state.gb.nodes.keys()))
+    if sabotage_node:
+        col_sab1, col_sab2 = st.sidebar.columns(2)
+        s_traffic = col_sab1.slider("Traffic", 0.0, 1.0, 0.5, key="sab_traffic")
+        s_weather = col_sab2.slider("Weather", 0.0, 1.0, 0.5, key="sab_weather")
+        
+        if st.sidebar.button("💥 Apply Chaos"):
+            st.session_state.node_overrides[sabotage_node] = {
+                "traffic": s_traffic,
+                "weather": s_weather
+            }
+            st.sidebar.success(f"Sabotaged {sabotage_node}!")
+
+        if st.sidebar.button("🧹 Clear Chaos"):
+            st.session_state.node_overrides = {}
+            st.sidebar.info("All chaos cleared.")
+else:
+    st.sidebar.info("Start simulation to enable sabotage.")
+
 if st.sidebar.button("Reset Simulation"):
     reset_simulation()
     if "view_state" in st.session_state:
@@ -689,37 +731,55 @@ with tabs[2]:
     st.header("UC3: Logistics Risk Visualization")
     
     st.markdown("### Risk Heatmap")
-    st.info("Visualizing high-risk zones based on Traffic Congestion and Weather Severity.")
+    st.info("Visualizing high-risk zones based on MLP Chaos Model (Predicted Delay Probability).")
     
-    # Generate Heatmap Data
-    heatmap_data = []
-    
-    # We'll use node locations, and add "weight" based on simulated risk factors
-    # For demo, we resample environment factors
-    for node_id in gb.nodes:
-        node = gb.get_node(node_id)
-        # Randomly sample risk factors to simulate "current" environmental state
-        traffic = st.session_state.calibrator.sample("traffic_congestion_level")
-        weather = st.session_state.calibrator.sample("weather_condition_severity")
-        risk_score = (traffic / 10.0 + weather) / 2.0
+    if model and preprocessor:
+        heatmap_data = []
         
-        heatmap_data.append({
-            "lat": node.lat,
-            "lon": node.lon,
-            "weight": risk_score
-        })
+        # Iterate over all nodes to probe "Risk" using the MLP
+        # We simulate a "virtual truck" arriving at each node
+        for node_id in gb.nodes:
+            node = gb.nodes[node_id]
+            
+            # 1. Create Dummy Event for feature extraction
+            # We use "SYSTEM" as truck_id, and current node as origin
+            dummy_event = Event(engine.current_time, "SYSTEM", node_id, EventType.ARRIVAL_NODE)
+            
+            # 2. Extract Features (reuses logic from UC1, including Sabotage overrides!)
+            try:
+                row_dict = DataConverter._create_row(
+                    dummy_event, st.session_state.calibrator, engine, gb, 
+                    start_date=pd.Timestamp.now(), include_context=False
+                )
+                
+                # 3. Preprocess & Predict
+                df_single = pd.DataFrame([row_dict])
+                features = preprocessor.transform(df_single)
+                features_tensor = torch.tensor(features, dtype=torch.float32)
+                
+                with torch.no_grad():
+                    prob = model(features_tensor).item()
+                
+                heatmap_data.append({
+                    "lat": node.lat,
+                    "lon": node.lon,
+                    "weight": prob # 0.0 to 1.0
+                })
+            except Exception as e:
+                # Fallback or skip if feature extraction fails
+                pass
+            
+        df_heat = pd.DataFrame(heatmap_data)
         
-    df_heat = pd.DataFrame(heatmap_data)
-    
-    deck_heat = pdk.Deck(
-        layers=[
-             pdk.Layer(
-                "HeatmapLayer",
-                data=df_heat,
-                get_position=["lon", "lat"],
-                get_weight="weight",
-                radius_pixels=60,
-            ),
+        deck_heat = pdk.Deck(
+            layers=[
+                 pdk.Layer(
+                    "HeatmapLayer",
+                    data=df_heat,
+                    get_position=["lon", "lat"],
+                    get_weight="weight",
+                    radius_pixels=60,
+                ),
             pdk.Layer(
                 "ScatterplotLayer",
                 data=df_heat,
