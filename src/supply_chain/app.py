@@ -9,10 +9,12 @@ import sys
 import os
 import math
 import base64
+import json
 from pathlib import Path
 import torch
 import numpy as np
 import pydeck as pdk
+import hashlib
 
 # Add src to path so we can import supply_chain package
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -68,8 +70,9 @@ def load_ai_assets():
     """Loads the trained MLP model and fits the preprocessor on historical data."""
     try:
         # Data still in experiments folder for fitting preprocessor
-        experiment_dir = Path(REPORTS_DIR) / "experiments" / "experiment_chaos"
-        data_path = experiment_dir / "simulated_data.csv"
+        # Data still in experiments folder for fitting preprocessor
+        project_root = Path(__file__).parent.parent.parent
+        data_path = project_root / "data" / "raw" / "simulated_supply_chain_data_2021_2025.csv"
         
         # Model moved to models/
         # Adjust path relative to project root or use absolute logic if needed
@@ -112,16 +115,27 @@ def load_gnn_model():
             return None
             
         # Initialize Architecture (Standard params from train.py)
-        model = SupplyChainGNN(in_channels=5, hidden_channels=64, out_channels=1)
+        # ST-GNN now expects 15 channels (3 steps * 5 features)
+        model = SupplyChainGNN(in_channels=15, hidden_channels=64, out_channels=1)
         model.load_state_dict(torch.load(model_path, map_location=torch.device('cpu')))
         model.eval()
-        return model
+        
+        # Load Scaler
+        scaler_path = project_root / "models" / "gnn_scaler.json"
+        scaler = None
+        if scaler_path.exists():
+            with open(scaler_path, 'r') as f:
+                scaler = json.load(f)
+        else:
+            st.warning("GNN Scaler not found. Inference will be unnormalized (likely poor).")
+            
+        return model, scaler
     except Exception as e:
         st.error(f"Failed to load GNN Model: {e}")
-        return None
+        return None, None
 
 model, preprocessor = load_ai_assets()
-gnn_model = load_gnn_model()
+gnn_model, gnn_scaler = load_gnn_model()
 
 
 # --- Helper Functions ---
@@ -193,21 +207,71 @@ def init_simulation():
             # Initialize simple calibrator for inference context
             st.session_state.calibrator = StatsCalibrator() # Uses default
 
-def reset_simulation():
-    if 'engine' in st.session_state:
-        del st.session_state.engine
     init_simulation()
+    # Reset GNN History on simulation reset
+    if 'gnn_history' in st.session_state:
+        del st.session_state.gnn_history
+
+def compute_edge_attrs(graph, node_mapping, current_time_min):
+    """
+    Computes dynamic edge attributes [Dist, Traffic, Weather] for GNN.
+    Matches logic in dataset.py.
+    """
+    edge_attrs = []
+    # Iterate exactly as edge_index is built (source-major, then undirected dup)
+    # But wait, edge_index must align with this list. 
+    # To be safe, we iterate sorted edges or store map? 
+    # PyG convention: edge_attr row i corresponds to edge_index col i.
+    # We must ensure loop order is IDENTICAL to edge_index construction.
+    
+    # We will return list of lists, caller converts to tensor.
+    
+    # Helper noise 
+    time_h = current_time_min / 60.0
+    def noise(lat, lon, t):
+        val = math.sin(lon/5.0 + t/24.0) + math.cos(lat/5.0 + t/48.0)
+        return (val + 2.0) / 4.0
+
+    # Must match get_current_graph_snapshot's edge iteration order!
+    # It iterates: for u, v in graph.edges(): append(u,v), append(v,u)
+    # So we do the same.
+    
+    for u, v in graph.edges():
+        if u in node_mapping and v in node_mapping:
+            src_node = graph.nodes[u]['data']
+            dst_node = graph.nodes[v]['data']
+            
+            dist = ((src_node.lat - dst_node.lat)**2 + (src_node.lon - dst_node.lon)**2) ** 0.5
+            dist_norm = dist / 10.0
+            
+            w_src = noise(src_node.lat, src_node.lon, time_h)
+            w_dst = noise(dst_node.lat, dst_node.lon, time_h)
+            weather = (w_src + w_dst) / 2.0
+            
+            t_src = noise(src_node.lat+10, src_node.lon+10, time_h)
+            t_dst = noise(dst_node.lat+10, dst_node.lon+10, time_h)
+            traffic = (t_src + t_dst) / 2.0
+            
+            # Forward Edge
+            edge_attrs.append([dist_norm, traffic, weather])
+            # Backward Edge
+            edge_attrs.append([dist_norm, traffic, weather])
+            
+    return torch.tensor(edge_attrs, dtype=torch.float)
 
 def get_current_graph_snapshot(engine, graph_builder):
     """
     Extracts current simulation state into a PyG Data object for GNN inference.
-    Fast extraction without pandas overhead.
+    Uses REAL simulation state (queues, history) and DETERMINISTIC environment factors.
     """
     from torch_geometric.data import Data
     
+    
     graph = graph_builder.graph
-    node_mapping = {n: i for i, n in enumerate(graph.nodes())}
-    num_nodes = len(graph.nodes)
+    # CRITICAL: Sort nodes by ID to ensure alignment across partial snapshots!
+    sorted_nodes = sorted(graph.nodes())
+    node_mapping = {n: i for i, n in enumerate(sorted_nodes)}
+    num_nodes = len(sorted_nodes)
     
     # 1. Edge Index
     src, dst = [], []
@@ -219,13 +283,21 @@ def get_current_graph_snapshot(engine, graph_builder):
             dst.append(node_mapping[u])
     edge_index = torch.tensor([src, dst], dtype=torch.long)
     
+    # 1.5 Edge Attrs
+    edge_attr = compute_edge_attrs(graph, node_mapping, engine.current_time)
+    
     # 2. Node Features [Num_Nodes, 5]
     # Features: [Type, Load, Traffic, Weather, Delay]
     x = torch.zeros((num_nodes, 5), dtype=torch.float)
     
-    # Traffic/Weather from calibrator context (or simplified global state)
-    # Ideally, we should pull from specific node state if engine tracks it physically.
-    # For now, we simulate "local" conditions based on the calibrator or engine internals.
+    # Helper for Delay Stat (Average service time of last N completed events)
+    # This is expensive if history is huge, but fine for demo scale.
+    node_delays = {}
+    for ev in reversed(engine.processed_events[-500:]): # Look at last 500 events
+        if ev.event_type == EventType.END_SERVICE and ev.node_id in node_mapping:
+            if ev.node_id not in node_delays:
+                node_delays[ev.node_id] = []
+            node_delays[ev.node_id].append(ev.details.get("service_duration", 0.0))
     
     for node_id, idx in node_mapping.items():
         node_data = graph.nodes[node_id]['data']
@@ -240,29 +312,81 @@ def get_current_graph_snapshot(engine, graph_builder):
         
         # Feature 1: Load (Pending Orders at this node)
         load = sum(1 for o in engine.orders.values() if o.origin_node_id == node_id and o.status == "ASSIGNED")
-        x[idx, 1] = load
+        x[idx, 1] = float(load)
         
-        # Feature 2 & 3: Context (Resampled for demo "live" volatility)
+        # Feature 4: Current Delays / Congestion (Calculate BASELINE first)
+        # Metric: Average Service Time + Queue Penalty
+        recent_times = node_delays.get(node_id, [])
+        avg_svc = sum(recent_times) / len(recent_times) if recent_times else 0.0
+        
+        # Queue penalty: If queue is long, "delay expectation" rises
+        queue_len = len(node_data.queue)
+        # Heuristic: Delay = Avg Service + (Queue * 5 mins)
+        estimated_delay = avg_svc + (queue_len * 5.0)
+
+        # Feature 2 & 3: Context (Deterministic or Override)
         # Check for manual overrides ("Sabotage")
         overrides = st.session_state.get('node_overrides', {})
         
         if node_id in overrides:
-            # User stuck this node!
-            x[idx, 2] = overrides[node_id].get('traffic', 0.5) * 10.0 # Scale to 0-10
-            x[idx, 3] = overrides[node_id].get('weather', 0.5)
-        elif hasattr(st.session_state, 'calibrator'):
-             x[idx, 2] = st.session_state.calibrator.sample("traffic_congestion_level")
-             x[idx, 3] = st.session_state.calibrator.sample("weather_condition_severity")
+             # User sabotaged this node! 
+             # Force High Traffic (Feature 2)
+             x[idx, 2] = overrides[node_id].get('traffic', 0.5) * 10.0 
+             # Force High Weather Severity (Feature 3)
+             x[idx, 3] = overrides[node_id].get('weather', 0.5)
+             
+             # CRITICAL: Also force Start Delay (Feature 4) to ensure GNN reacts immediately
+             # 60.0 mins = Risk 1.0 roughly
+             if x[idx, 2] > 7.0: # If traffic is high
+                 # Deterministic "Expected" sabotage delay, or maintain RNG for jitter
+                 # We need a stable random source here if we want jitter without global pollution
+                 # But sticking to user request: "forced = 45.0 + rng.uniform(0, 30)"
+                 
+                 # Initialize private RNG for this node/time
+                 # Use stable hash for seeding instead of hash()
+                 node_hash = int(hashlib.md5(str(node_id).encode()).hexdigest(), 16)
+                 seed_val = node_hash + int(engine.current_time / 60.0)
+                 rng = random.Random(seed_val)
+                 
+                 forced = 45.0 + rng.uniform(0, 30) # 45-75 mins delay
+                 
+                 # Take MAX of real estimation vs forced delay
+                 # This ensures we don't accidentally LOWER the risk if the node is ALREADY clogged naturally
+                 x[idx, 4] = max(float(estimated_delay), float(forced))
+             else:
+                 x[idx, 4] = float(estimated_delay)
+                 
+        else:
+            # Deterministic Seeding based on Node + Time (Hour)
+            # This ensures stable predictions within the same simulation hour
+            # Use stable hash for seeding instead of hash()
+            node_hash = int(hashlib.md5(str(node_id).encode()).hexdigest(), 16)
+            seed_val = node_hash + int(engine.current_time / 60.0)
+            
+            # Use private RNG instance to avoid polluting global random state
+            rng = random.Random(seed_val)
+            
+            # Simulate "Live" Traffic/Weather
+            traffic_sim = rng.uniform(0, 10)
+            weather_sim = rng.uniform(0, 1)
+            
+            x[idx, 2] = float(traffic_sim)
+            x[idx, 3] = float(weather_sim)
+            
+            # Normal delay estimation
+            x[idx, 4] = float(estimated_delay)
         
-        # Feature 4: Current Delays (Avg delay of recent arrivals at this node)
-        x[idx, 4] = 0.0 # Placeholder for live simulation
-        
-    return Data(x=x, edge_index=edge_index)
+    return Data(x=x, edge_index=edge_index, edge_attr=edge_attr)
 
 
 def render_pydeck_map(engine, graph_builder, show_gnn_risk=False):
-    """Render the graph using PyDeck."""
+    """Render the graph using PyDeck and handle GNN History/Inference."""
     graph = graph_builder.graph
+    
+    # Initialize History Buffer if needed
+    if 'gnn_history' not in st.session_state:
+         # Deque of tensors [Num_Nodes, 5]
+         st.session_state.gnn_history = []
 
     # Load Icon Atlas (Served via Streamlit Static Files if configured, else default)
     # Using simple color coding for now as fallback
@@ -426,43 +550,99 @@ def render_pydeck_map(engine, graph_builder, show_gnn_risk=False):
     if show_gnn_risk:
         if gnn_model:
             # Inference
+            # Inference
             snapshot = get_current_graph_snapshot(engine, graph_builder)
+            
+            # HISTORY MANAGEMENT
+            history = st.session_state.gnn_history
+            
+            # Add current features to history
+            # Clone to detach from graph changes if any (though x is new tensor)
+            history.append(snapshot.x)
+            
+            # Maintain max size 3
+            if len(history) > 3:
+                history.pop(0)
+            
+            # Prepare Stacked Input
+            # If we don't have 3 steps yet, pad with the oldest available
+            # e.g. [T0] -> [T0, T0, T0]
+            # [T0, T1] -> [T0, T0, T1]
+            input_stack = []
+            if len(history) == 0:
+                 # Should not happen as we just appended
+                 input_stack = [snapshot.x] * 3
+            elif len(history) == 1:
+                 input_stack = [history[0]] * 3
+            elif len(history) == 2:
+                 input_stack = [history[0], history[0], history[1]]
+            else:
+                 input_stack = list(history) # [t-2, t-1, t]
+                 
+            # Concatenate features [Num_Nodes, 15]
+            x_windowed = torch.cat(input_stack, dim=1)
+            edge_attr_inf = snapshot.edge_attr
+            
+            # NORMALIZATION
+            if gnn_scaler:
+                # x [N, 15]
+                xm = torch.tensor(gnn_scaler["x_mean"])
+                xs = torch.tensor(gnn_scaler["x_std"])
+                x_windowed = (x_windowed - xm) / xs
+                
+                # edge [E, 3]
+                em = torch.tensor(gnn_scaler["edge_mean"])
+                es = torch.tensor(gnn_scaler["edge_std"])
+                edge_attr_inf = (edge_attr_inf - em) / es
+            
             with torch.no_grad():
-                risk_scores = gnn_model(snapshot.x, snapshot.edge_index)
+                # Correct call with 15-dim input and edge attributes
+                logits = gnn_model(x_windowed, snapshot.edge_index, edge_attr_inf)
+                risk_scores = torch.sigmoid(logits)
             
             gnn_data = []
             max_risk = risk_scores.max().item()
             for i, score in enumerate(risk_scores):
-                node_id = list(snapshot.x.size())[0] # Helper only, mapping needed
-                # Reconstruct mapping (Assuming order is preserved from graph.nodes())
-                node_id = list(graph.nodes())[i]
+                # Use sorted nodes to match mapping logic in get_current_graph_snapshot
+                node_id = sorted(graph.nodes())[i] 
                 node = graph.nodes[node_id]['data']
+                
+                # Get input features for this node to debug
+                x_val_delay = snapshot.x[i, 4].item()
                 
                 risk_val = score.item()
                 # Color Gradient: Green (0) -> Red (1)
                 r = int(255 * risk_val)
                 g = int(255 * (1 - risk_val))
                 
+                # Debug Sabotage
+                if risk_val < 0.1 and x_val_delay > 10.0:
+                     print(f"⚠️ DEBUG: Node {node_id} has HIGH DELAY ({x_val_delay}) bu LOW PREDICTION ({risk_val})")
+                
                 gnn_data.append({
                     "lon": node.lon,
                     "lat": node.lat,
-                    "radius": 6000 * risk_val, # Bigger radius = Higher Risk
-                    "color": [r, g, 0, 150], # Semi-transparent
+                    "weight": risk_val,   # For Heatmap
                     "risk": f"{risk_val:.2f}"
                 })
                 
             layers.append(pdk.Layer(
-                "ScatterplotLayer",
+                "HeatmapLayer",
                 gnn_data,
                 get_position=["lon", "lat"],
-                get_fill_color="color",
-                get_radius="radius",
-                pickable=True,
+                get_weight="weight",
+                radius_pixels=80,      # "Smuga" effect radius
+                intensity=1.5,
+                threshold=0.05,        # Filter low risk noise
                 opacity=0.6,
-                stroked=True,
-                filled=True,
-                radius_min_pixels=5,
-                radius_max_pixels=40
+                # Gradient: Transparent -> Red
+                color_range=[
+                    [255, 255, 178],   # Light Yellow
+                    [254, 204, 92],
+                    [253, 141, 60],
+                    [240, 59, 32],
+                    [189, 0, 38]       # Deep Red
+                ]
             ))
         else:
             # Cannot show warning easily in map renderer, avoiding side effects
@@ -496,6 +676,12 @@ def render_pydeck_map(engine, graph_builder, show_gnn_risk=False):
         tooltip={"text": "{id}\n{type}\n{status}\nRisk: {risk}"}, # Added Risk to tooltip
         map_style="mapbox://styles/mapbox/dark-v10"
     )
+
+# --- Initialize Simulation (Before UI) ---
+init_simulation()
+engine = st.session_state.engine
+graph_builder = st.session_state.graph_builder # Use full name for clarity
+gb = graph_builder
 
 # --- Sidebar ---
 st.sidebar.header("Configuration")
@@ -545,8 +731,8 @@ st.sidebar.subheader("🔥 Chaos / Sabotage")
 if 'node_overrides' not in st.session_state:
     st.session_state.node_overrides = {}
 
-if 'gb' in st.session_state and st.session_state.gb:
-    sabotage_node = st.sidebar.selectbox("Select Node to Sabotage", list(st.session_state.gb.nodes.keys()))
+if 'graph_builder' in st.session_state and st.session_state.graph_builder:
+    sabotage_node = st.sidebar.selectbox("Select Node to Sabotage", list(st.session_state.graph_builder.nodes.keys()))
     if sabotage_node:
         col_sab1, col_sab2 = st.sidebar.columns(2)
         s_traffic = col_sab1.slider("Traffic", 0.0, 1.0, 0.5, key="sab_traffic")
@@ -565,15 +751,45 @@ if 'gb' in st.session_state and st.session_state.gb:
 else:
     st.sidebar.info("Start simulation to enable sabotage.")
 
+# --- Auto Chaos Mode ---
+auto_chaos = st.sidebar.checkbox("🌪️ Enable Dynamic Chaos Mode", value=False, help="Automatically sabotages random nodes periodically.")
+
+if auto_chaos:
+    targets = list(st.session_state.get('node_overrides', {}).keys())
+    if targets:
+        st.sidebar.markdown(f"**🔥 Active Targets:** {', '.join(targets)}")
+    else:
+        st.sidebar.markdown("*(No active chaos yet)*")
+
 if st.sidebar.button("Reset Simulation"):
     reset_simulation()
     if "view_state" in st.session_state:
         del st.session_state.view_state
 
-# Initialize
-init_simulation()
-engine = st.session_state.engine
-gb = st.session_state.graph_builder
+# Chaos Logic Helper
+def manage_dynamic_chaos(engine, graph_builder):
+    if not auto_chaos: return
+    
+    # Probability to start new chaos
+    if random.random() < 0.05: # 5% chance per frame
+        # Pick random node
+        nodes = list(graph_builder.nodes.keys())
+        target = random.choice(nodes)
+        
+        # Apply Sabotage
+        st.session_state.node_overrides[target] = {
+            "traffic": random.uniform(0.7, 1.0), # High traffic
+            "weather": random.uniform(0.4, 0.9)
+        }
+        
+    # Probability to clear chaos
+    # We iterate copy to allow modification
+    current_targets = list(st.session_state.node_overrides.keys())
+    for target in current_targets:
+        if random.random() < 0.02: # 2% chance to clear existing chaos
+             del st.session_state.node_overrides[target]
+
+
 
 # --- Main Page ---
 st.title("Supply Chain Digital Twin & AI Ops")
@@ -602,6 +818,27 @@ with tabs[0]:
             for _ in range(sim_speed):
                 if engine.event_queue:
                     engine.step()
+            # Dynamic Chaos Update
+            if auto_chaos:
+                manage_dynamic_chaos(engine, gb)
+
+            # Infinite Simulation Logic: Respawn orders if running low
+            # Count active orders (Assigned/Created but not Completed)
+            active_orders = sum(1 for o in engine.orders.values() if o.status not in ["COMPLETED", "CANCELLED"])
+            if active_orders < 15: # Sustain at least 15 active orders
+                # Spawn new batch
+                all_ids = list(gb.nodes.keys())
+                for _ in range(5):
+                    origin = random.choice(all_ids)
+                    dest = random.choice(all_ids)
+                    while dest == origin: dest = random.choice(all_ids)
+                    
+                    new_oid = f"ORD_{int(engine.current_time)}_{random.randint(100,999)}"
+                    engine.schedule_event(Event(
+                        engine.current_time + random.uniform(0, 10), # Slight delay
+                        "SYSTEM", origin, EventType.ORDER_CREATED,
+                        details={"order_id": new_oid, "origin": origin, "destination": dest}
+                    ))
                     
         # Metrics
         completed = [o for o in engine.orders.values() if o.status == "COMPLETED"]

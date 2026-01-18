@@ -6,6 +6,7 @@ import numpy as np
 import networkx as nx
 from pathlib import Path
 from tqdm import tqdm
+import json
 from supply_chain.simulation.schema import NodeType
 
 class SupplyChainGraphDataset:
@@ -15,6 +16,7 @@ class SupplyChainGraphDataset:
     """
     def __init__(self, graph_builder, dataframe: pd.DataFrame, time_window_min: int = 60):
         self.graph = graph_builder.graph
+        self.scaler_path = Path(__file__).resolve().parent.parent.parent.parent / "models" / "gnn_scaler.json"
         
         # Parse timestamp string to datetime
         dataframe['timestamp'] = pd.to_datetime(dataframe['timestamp'])
@@ -47,35 +49,174 @@ class SupplyChainGraphDataset:
                 dst.append(self.node_mapping[u])
         
         return torch.tensor([src, dst], dtype=torch.long)
+        
+    def _build_edge_attr(self, timestamp_numeric: float):
+        """
+        Builds edge attributes [Num_Edges, 3] -> [Distance, Traffic, Weather]
+        Dynamic based on timestamp (for traffic/weather noise).
+        """
+        feats = []
+        for u, v in self.graph.edges():
+            src_node = self.graph.nodes[u]['data']
+            dst_node = self.graph.nodes[v]['data']
+            
+            # Static Distance
+            # Heuristic: 0.01 deg ~= 1km
+            dist = ((src_node.lat - dst_node.lat)**2 + (src_node.lon - dst_node.lon)**2) ** 0.5
+            dist_norm = dist / 10.0 # Normalize roughly 0-1 range for typical map
+            
+            # Dynamic Traffic/Weather (Mean of endpoints)
+            # Use pseudo-random spatial noise based on time
+            # We don't have the Integration calib here easily, so we mimic logic or use simple sine
+            time_h = timestamp_numeric / 60.0
+            
+            # Simple noise function
+            import math
+            def noise(lat, lon, t):
+                val = math.sin(lon/5.0 + t/24.0) + math.cos(lat/5.0 + t/48.0)
+                return (val + 2.0) / 4.0
+            
+            w_src = noise(src_node.lat, src_node.lon, time_h)
+            w_dst = noise(dst_node.lat, dst_node.lon, time_h)
+            weather = (w_src + w_dst) / 2.0
+            
+            t_src = noise(src_node.lat+10, src_node.lon+10, time_h)
+            t_dst = noise(dst_node.lat+10, dst_node.lon+10, time_h)
+            traffic = (t_src + t_dst) / 2.0
+            
+            feats.append([dist_norm, traffic, weather])
+            
+            # Undirected duplicate
+            feats.append([dist_norm, traffic, weather])
+            
+        return torch.tensor(feats, dtype=torch.float)
 
     def process(self):
         """
-        Groups data by time windows and creates graph snapshots.
-        Each snapshot represents the state of the network at a specific time block.
+        Groups data by time windows and creates graph snapshots with FUTURE targets.
+        X(t) -> Y(t+1)
         """
         # 1. Bucketize timestamps
         self.df['time_bucket'] = (self.df['timestamp_numeric'] // self.time_window).astype(int)
         grouped = self.df.groupby('time_bucket')
         
-        print(f"Stats: Processing {len(grouped)} temporal snapshots...")
+        print(f"Stats: Processing {len(grouped)} temporal buckets...")
         
-        for _, group in tqdm(grouped):
+        # 2. Create raw snapshots (X_t, Y_t_actual) for each bucket
+        raw_snapshots = []
+        timestamps = []
+        
+        # Sort by bucket ID to ensure temporal order
+        sorted_groups = sorted(grouped, key=lambda x: x[0])
+        
+        for _, group in tqdm(sorted_groups, desc="Building Snapshots"):
             snapshot = self._create_snapshot(group)
-            self.snapshots.append(snapshot)
+            raw_snapshots.append(snapshot)
+            # Use first timestamp in group as ref
+            if not group.empty:
+                timestamps.append(group['timestamp_numeric'].iloc[0])
+            else:
+                timestamps.append(0.0)
             
-        print(f"✅ Created {len(self.snapshots)} graph snapshots.")
+        # 3. Temporal Stacking (Window = 3)
+        # We need at least Window+1 snapshots to make 1 sample (Window inputs -> 1 Target)
+        WINDOW_SIZE = 3
+        
+        if len(raw_snapshots) <= WINDOW_SIZE:
+             print("❌ Not enough snapshots for windowing.")
+             return
+
+        for i in range(WINDOW_SIZE, len(raw_snapshots) - 1):
+             # Input: Stack features from [i-2, i-1, i]
+             # Target: Y from i+1 (Next Step Risk)
+             
+             # Stack Node Features
+             stack_x = []
+             for w in range(WINDOW_SIZE):
+                 # index = i - (WINDOW_SIZE - 1) + w  => [i-2, i-1, i]
+                 idx = i - (WINDOW_SIZE - 1) + w
+                 stack_x.append(raw_snapshots[idx].x)
+                 
+             # Concatenate along Feature Dimension (dim=1)
+             # Shape: [Num_Nodes, 5] * 3 -> [Num_Nodes, 15]
+             x_windowed = torch.cat(stack_x, dim=1)
+             
+             # Edges & Attributes (Dynamic based on current time T=i)
+             curr_time = timestamps[i]
+             edge_attr = self._build_edge_attr(curr_time)
+             
+             y_target = raw_snapshots[i+1].y
+             
+             data = Data(
+                 x=x_windowed,
+                 edge_index=self.edge_index,
+                 edge_attr=edge_attr,
+                 y=y_target
+             )
+             
+             self.snapshots.append(data)
+            
+        if len(self.snapshots) > 0:
+             self._compute_and_save_scaler()
+             self._normalize_data()
+             
+        print(f"✅ Created {len(self.snapshots)} windowed sequences (Input: T-2..T -> Target: T+1).")
+        
+    def _compute_and_save_scaler(self):
+        """Computes Mean and Std for X and EdgeAttr based on current snapshots."""
+        print("   Computing Scaler Stats...")
+        
+        # Collect all x and edge_attr
+        all_x = torch.cat([data.x for data in self.snapshots], dim=0) # [Total_Nodes, 15]
+        all_edge = torch.cat([data.edge_attr for data in self.snapshots], dim=0) # [Total_Edges, 3]
+        
+        # Compute Stats
+        x_mean = all_x.mean(dim=0).tolist()
+        x_std = all_x.std(dim=0).tolist()
+        
+        e_mean = all_edge.mean(dim=0).tolist()
+        e_std = all_edge.std(dim=0).tolist()
+        
+        # Avoid div by zero
+        x_std = [s if s > 1e-5 else 1.0 for s in x_std]
+        e_std = [s if s > 1e-5 else 1.0 for s in e_std]
+        
+        stats = {
+            "x_mean": x_mean, "x_std": x_std,
+            "edge_mean": e_mean, "edge_std": e_std
+        }
+        
+        self.scaler_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(self.scaler_path, 'w') as f:
+            json.dump(stats, f)
+        print(f"   Scaler saved to {self.scaler_path}")
+        
+    def _normalize_data(self):
+        """Applies normalization to all snapshots in memory."""
+        # Reload stats to be sure (or just use what we computed)
+        with open(self.scaler_path, 'r') as f:
+            stats = json.load(f)
+            
+        x_mean = torch.tensor(stats["x_mean"])
+        x_std = torch.tensor(stats["x_std"])
+        e_mean = torch.tensor(stats["edge_mean"])
+        e_std = torch.tensor(stats["edge_std"])
+        
+        for data in self.snapshots:
+            data.x = (data.x - x_mean) / x_std
+            data.edge_attr = (data.edge_attr - e_mean) / e_std
 
     def _create_snapshot(self, group_df: pd.DataFrame) -> Data:
         # Initialize Node Features Matrix [Num_Nodes, Num_Features]
         # Features: 
         # 0: Node Type (Ordinal)
         # 1: Order Load (Count of events in this bucket)
-        # 2: Avg Delay (in this bucket) - TARGET for some tasks, Feature for others?
-        # Let's say we want to predict "Risk" for the NEXT bucket. 
-        # But for now, let's build features representing the CURRENT state.
+        # 2: Traffic
+        # 3: Weather
+        # 4: Avg Delay (Current bucket) - Safe Feature for predicting Next Bucket Risk
         
         x = torch.zeros((self.num_nodes, 5), dtype=torch.float)
-        y = torch.zeros((self.num_nodes, 1), dtype=torch.float) # Risk Score
+        y = torch.zeros((self.num_nodes, 1), dtype=torch.float) # Calculated Risk
         
         # Static Features (Type)
         for node_id, idx in self.node_mapping.items():
@@ -99,24 +240,25 @@ class SupplyChainGraphDataset:
             
             # Feature 1: Event Count (Load)
             count = len(records)
-            x[idx, 1] = count
+            x[idx, 1] = float(count)
             
             # Feature 2: High Traffic Flag (Avg of traffic level)
             avg_traffic = records['traffic_congestion_level'].mean()
-            x[idx, 2] = avg_traffic if not pd.isna(avg_traffic) else 0.0
+            x[idx, 2] = float(avg_traffic) if not pd.isna(avg_traffic) else 0.0
 
             # Feature 3: Bad Weather Flag
             avg_weather = records['weather_condition_severity'].mean()
-            x[idx, 3] = avg_weather if not pd.isna(avg_weather) else 0.0
+            x[idx, 3] = float(avg_weather) if not pd.isna(avg_weather) else 0.0
             
             # Feature 4: Avg Delay (Current Performance)
             avg_delay = records['delivery_time_deviation'].mean()
-            x[idx, 4] = avg_delay if not pd.isna(avg_delay) else 0.0
+            x[idx, 4] = float(avg_delay) if not pd.isna(avg_delay) else 0.0
 
-            # Target: Inefficiency Score (Simple heuristic for now)
-            # If delay > 30 mins, risk = 1.0, else mapped sigmoidally
+            # Target Calculation (for this bucket)
+            # This y will be the TARGET for the PREVIOUS bucket in process()
+            # If delay > 60 mins (1h), risk = 1.0, else mapped sigmoidally/linearly
             risk = 1.0 if avg_delay > 60 else (avg_delay / 60.0 if avg_delay > 0 else 0)
-            y[idx, 0] = risk
+            y[idx, 0] = float(risk)
 
         # Construct Data Object
         data = Data(x=x, edge_index=self.edge_index, y=y)

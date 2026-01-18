@@ -151,7 +151,6 @@ class DatasetSchema:
         """Features that are logically binary (0/1)."""
         return (
             "handling_equipment_availability",
-            "order_fulfillment_status",
             "cargo_condition_status",
         )
 
@@ -180,6 +179,7 @@ class DatasetSchema:
             "disruption_likelihood_score",
             "delay_probability",
             "delivery_time_deviation",
+            "order_fulfillment_status",
         )
 
     @property

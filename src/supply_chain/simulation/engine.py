@@ -103,9 +103,26 @@ class SimulationEngine:
         min_dist = float('inf')
         
         for truck in idle_trucks:
-
-            best_truck = truck
-            break
+            # Calculate distance (Manhattan or Haversine approximation)
+            # Since we don't have lat/lon easily available here without graph lookup,
+            # we use the graph builder's pathfinding which includes distance.
+            # But pathfinding is expensive. 
+            # Optimization: Just look at current_node_id vs origin_node_id
+            
+            try:
+                truck_node = self.graph_builder.get_node(truck.current_node_id)
+                origin_node = self.graph_builder.get_node(order.origin_node_id)
+                
+                # Simple Euclidean/Manhattan for quick dispatch heuristic
+                # (Latitude/Longitude are roughly linear locally)
+                dist = abs(truck_node.lat - origin_node.lat) + abs(truck_node.lon - origin_node.lon)
+                
+                if dist < min_dist:
+                    min_dist = dist
+                    best_truck = truck
+            except Exception:
+                # Fallback if node lookup fails
+                continue
         
         if best_truck:
             self.assign_order_to_truck(order, best_truck)
