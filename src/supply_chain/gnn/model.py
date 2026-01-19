@@ -49,13 +49,17 @@ class SupplyChainGNN(torch.nn.Module):
         """
         
         # 1. Embedding Highlighting
-        # Assuming Feature 10 (idx 10) is "Type" of current time T (window 0,1,2 -> 2 is current)
-        # x[:, 10] should be type.
-        # Note: In windowing, we just concatenated.
-        # Let's extract type from the last chunk (Current Time).
-        # x is [N, 15]. Last chunk starts at index 10 (since 5 features per step).
+        # Dynamic Type Index Calculation
+        # x shape: [N, channels]. Steps = 3. Features per step = channels // 3.
+        # "Current" Type feature is at the start of the 3rd chunk (T).
+        step_dim = x.size(1) // 3
+        type_idx = 2 * step_dim + 0 # Start of 3rd chunk
         
-        current_type = x[:, 10].long()
+        current_type = x[:, type_idx].long()
+        # Safety: Clamp to valid range [0, 4] to prevent CUDA Assert failures
+        current_type = torch.clamp(current_type, 0, 4)
+        current_type = torch.clamp(current_type, min=0, max=4)
+        
         type_emb = self.type_embedding(current_type) # [N, 8]
         
         # Concat everything

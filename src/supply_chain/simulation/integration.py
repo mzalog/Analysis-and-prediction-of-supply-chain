@@ -46,6 +46,7 @@ SIMULATION_COLUMNS = [
     "delay_probability",
     "risk_classification",
     "delivery_time_deviation",
+    "pending_orders_count",
 ]
 
 KAGGLE_COLUMNS = SIMULATION_COLUMNS[6:]
@@ -313,14 +314,20 @@ class DataConverter:
         if engine and hasattr(engine, 'trucks') and hasattr(engine, 'orders'):
              num_trucks = len(engine.trucks)
              
-             # OPTIMIZED: active = pending queue + orders currently on trucks
-             # Avoiding O(N) iteration over full history
-             pending_count = len(engine.pending_orders)
+             # Global stats for Capacity Penalty
+             pending_count_global = len(engine.pending_orders)
              in_transit_count = sum(1 for t in engine.trucks.values() if t.assigned_order_id)
-             active_orders_count = pending_count + in_transit_count
+             active_orders_count = pending_count_global + in_transit_count
              
              if num_trucks > 0:
                  utilization_ratio = active_orders_count / num_trucks
+        
+        # Local Backlog (Feature for GNN)
+        node_backlog = 0
+        if engine and event.node_id:
+            # Count pending orders originating from THIS node
+            # Optimization: could maintain a separate map, but filter is okay for N=100-500 orders
+            node_backlog = sum(1 for oid in engine.pending_orders if engine.orders[oid].origin_node_id == event.node_id)
                  
         # Delay Calculation Logic (Organic)
         base_delay_dev = calibrator.sample("delivery_time_deviation")
@@ -468,6 +475,7 @@ class DataConverter:
             "delay_probability": round(delay_prob, 4),
             "risk_classification": risk_class,
             "delivery_time_deviation": round(deviation, 2),
+            "pending_orders_count": node_backlog,
         })
         
         return result

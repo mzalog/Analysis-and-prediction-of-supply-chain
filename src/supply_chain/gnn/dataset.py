@@ -14,37 +14,43 @@ class SupplyChainGraphDataset:
     Manages the conversion of Supply Chain simulation data into Graph Snapshots
     compatible with PyTorch Geometric.
     """
-    def __init__(self, graph_builder, dataframe: pd.DataFrame, time_window_min: int = 60):
+    def __init__(self, graph_builder, data_dir: Path = None, dataframe: pd.DataFrame = None, time_window_min: int = 60):
         self.graph = graph_builder.graph
-        self.scaler_path = Path(__file__).resolve().parent.parent.parent.parent / "models" / "gnn_scaler.json"
         
-        # Parse timestamp string to datetime
-        dataframe['timestamp'] = pd.to_datetime(dataframe['timestamp'])
-        self.df = dataframe.sort_values('timestamp')
-        
-        # Convert to minutes from start (numeric)
-        start_time = self.df['timestamp'].iloc[0]
-        self.df['timestamp_numeric'] = (self.df['timestamp'] - start_time).dt.total_seconds() / 60.0
+        # Mode A: Load from Directory of Episodes (Preferred)
+        self.episode_files = []
+        if data_dir and data_dir.exists():
+             self.episode_files = sorted(list(data_dir.glob("episode_*.csv")))
+             
+        # Mode B: Single DataFrame (Legacy/App inference)
+        self.dataframe = dataframe
         
         self.time_window = time_window_min
-        self.node_mapping = {n: i for i, n in enumerate(self.graph.nodes())}
+        
+        # CRITICAL: Sort nodes to ensure index stability across time steps and inference
+        self.sorted_nodes = sorted(list(self.graph.nodes()))
+        self.node_mapping = {n: i for i, n in enumerate(self.sorted_nodes)}
         self.reverse_mapping = {i: n for n, i in self.node_mapping.items()}
         self.num_nodes = len(self.graph.nodes)
         
         # Pre-compute edge index (Static Topology)
         self.edge_index = self._build_edge_index()
-        self.snapshots = []
+        
+        # Storage: List of Lists (Episodes -> Snapshots)
+        self.episodes = [] 
+        # Flat list (optional, constructed dynamically or used for legacy)
+        self._flat_snapshots = []
 
     def _build_edge_index(self):
         """Converts NetworkX edges to PyG edge_index format."""
         src, dst = [], []
-        for u, v in self.graph.edges():
+        # Ensure iteration order is consistent if edge attributes depend on it?
+        # Better to iterate sorted edges
+        for u, v in sorted(self.graph.edges()):
             if u in self.node_mapping and v in self.node_mapping:
                 src.append(self.node_mapping[u])
                 dst.append(self.node_mapping[v])
-                # Undirected graph assumption for roads usually, 
-                # but let's keep it directed if defined that way.
-                # If undirected in simulation, add reverse edge
+                # Undirected assumption (add reverse info)
                 src.append(self.node_mapping[v])
                 dst.append(self.node_mapping[u])
         
@@ -56,7 +62,8 @@ class SupplyChainGraphDataset:
         Dynamic based on timestamp (for traffic/weather noise).
         """
         feats = []
-        for u, v in self.graph.edges():
+        # MUST match _build_edge_index iteration order
+        for u, v in sorted(self.graph.edges()):
             src_node = self.graph.nodes[u]['data']
             dst_node = self.graph.nodes[v]['data']
             
@@ -66,11 +73,9 @@ class SupplyChainGraphDataset:
             dist_norm = dist / 10.0 # Normalize roughly 0-1 range for typical map
             
             # Dynamic Traffic/Weather (Mean of endpoints)
-            # Use pseudo-random spatial noise based on time
-            # We don't have the Integration calib here easily, so we mimic logic or use simple sine
             time_h = timestamp_numeric / 60.0
             
-            # Simple noise function
+            # Simple noise function independent of integration dependencies
             import math
             def noise(lat, lon, t):
                 val = math.sin(lon/5.0 + t/24.0) + math.cos(lat/5.0 + t/48.0)
@@ -85,7 +90,6 @@ class SupplyChainGraphDataset:
             traffic = (t_src + t_dst) / 2.0
             
             feats.append([dist_norm, traffic, weather])
-            
             # Undirected duplicate
             feats.append([dist_norm, traffic, weather])
             
@@ -93,118 +97,124 @@ class SupplyChainGraphDataset:
 
     def process(self):
         """
-        Groups data by time windows and creates graph snapshots with FUTURE targets.
-        X(t) -> Y(t+1)
+        Process available data into graph snapshots.
+        Handles both Multi-Episode (Files) and Single-Stream (DataFrame).
         """
-        # 1. Bucketize timestamps
-        self.df['time_bucket'] = (self.df['timestamp_numeric'] // self.time_window).astype(int)
-        grouped = self.df.groupby('time_bucket')
+        if self.episode_files:
+            print(f"Stats: Found {len(self.episode_files)} episodes in {self.episode_files[0].parent}")
+            for fpath in tqdm(self.episode_files, desc="Processing Episodes"):
+                df = pd.read_csv(fpath)
+                episode_snaps = self._process_dataframe(df)
+                if episode_snaps:
+                    self.episodes.append(episode_snaps)
+            
+            print(f"✅ Processed {len(self.episodes)} episodes.")
+            
+        elif self.dataframe is not None:
+            # Legacy/App mode
+            snaps = self._process_dataframe(self.dataframe)
+            self.episodes.append(snaps)
+            
+    @property
+    def snapshots(self):
+        """Flattened list of all snapshots (for backward compatibility)."""
+        if not self._flat_snapshots and self.episodes:
+            self._flat_snapshots = [s for ep in self.episodes for s in ep]
+        return self._flat_snapshots
+
+    def _process_dataframe(self, df: pd.DataFrame) -> list:
+        """Helper to process a single DataFrame (one episode) into sequence."""
+        # Reset history for this new episode
+        self.last_delays = {}
         
-        print(f"Stats: Processing {len(grouped)} temporal buckets...")
+        # Preprocess Time
+        if 'timestamp' in df.columns and df['timestamp'].dtype == object:
+             df['timestamp'] = pd.to_datetime(df['timestamp'])
+             
+        # Normalize time to minutes from start of THIS episode
+        start_time = df['timestamp'].iloc[0]
+        df['timestamp_numeric'] = (df['timestamp'] - start_time).dt.total_seconds() / 60.0
         
-        # 2. Create raw snapshots (X_t, Y_t_actual) for each bucket
+        # Ensure numeric types for aggregation (robust to mixed dtypes)
+        numeric_cols = [
+            "traffic_congestion_level",
+            "weather_condition_severity",
+            "delivery_time_deviation",
+            "pending_orders_count",
+        ]
+        for col in numeric_cols:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
+
+        # 1. Bucketize
+        df['time_bucket'] = (df['timestamp_numeric'] // self.time_window).astype(int)
+        grouped = df.groupby('time_bucket')
+        
+        # 2. Raw Snapshots
         raw_snapshots = []
         timestamps = []
-        
-        # Sort by bucket ID to ensure temporal order
         sorted_groups = sorted(grouped, key=lambda x: x[0])
         
-        for _, group in tqdm(sorted_groups, desc="Building Snapshots"):
+        for _, group in sorted_groups:
             snapshot = self._create_snapshot(group)
             raw_snapshots.append(snapshot)
-            # Use first timestamp in group as ref
             if not group.empty:
                 timestamps.append(group['timestamp_numeric'].iloc[0])
             else:
                 timestamps.append(0.0)
-            
-        # 3. Temporal Stacking (Window = 3)
-        # We need at least Window+1 snapshots to make 1 sample (Window inputs -> 1 Target)
+                
+        # 3. Windowing & Padding
         WINDOW_SIZE = 3
         
+        # Cold-Start Padding
+        if raw_snapshots:
+            padding = [raw_snapshots[0]] * (WINDOW_SIZE - 1)
+            raw_snapshots = padding + raw_snapshots
+            # Adjust timestamps? Not strictly needed for logic, but good for keeping sync
+            timestamps = [timestamps[0]]*(WINDOW_SIZE-1) + timestamps
+            
+        processed_sequence = []
+        
         if len(raw_snapshots) <= WINDOW_SIZE:
-             print("❌ Not enough snapshots for windowing.")
-             return
+             return []
 
-        for i in range(WINDOW_SIZE, len(raw_snapshots) - 1):
-             # Input: Stack features from [i-2, i-1, i]
-             # Target: Y from i+1 (Next Step Risk)
-             
-             # Stack Node Features
+        FORECAST_HORIZON = 3
+        
+        # Loop until we have enough future data for lookahead
+        for i in range(WINDOW_SIZE, len(raw_snapshots) - FORECAST_HORIZON):
+             # Window: [i-2, i-1, i] -> Features
              stack_x = []
              for w in range(WINDOW_SIZE):
-                 # index = i - (WINDOW_SIZE - 1) + w  => [i-2, i-1, i]
                  idx = i - (WINDOW_SIZE - 1) + w
                  stack_x.append(raw_snapshots[idx].x)
-                 
-             # Concatenate along Feature Dimension (dim=1)
-             # Shape: [Num_Nodes, 5] * 3 -> [Num_Nodes, 15]
+             
              x_windowed = torch.cat(stack_x, dim=1)
              
-             # Edges & Attributes (Dynamic based on current time T=i)
+             # Edges
              curr_time = timestamps[i]
              edge_attr = self._build_edge_attr(curr_time)
              
-             y_target = raw_snapshots[i+1].y
-             
-             data = Data(
-                 x=x_windowed,
-                 edge_index=self.edge_index,
-                 edge_attr=edge_attr,
-                 y=y_target
+             # Target: Early-warning event based on future delay/backlog
+             future_delays = torch.stack(
+                 [raw_snapshots[j].x[:, 4] for j in range(i + 1, i + 1 + FORECAST_HORIZON)],
+                 dim=1,
              )
+             future_backlogs = torch.stack(
+                 [raw_snapshots[j].x[:, 5] for j in range(i + 1, i + 1 + FORECAST_HORIZON)],
+                 dim=1,
+             )
+
+             max_delay = future_delays.max(dim=1).values
+             max_backlog = future_backlogs.max(dim=1).values
+
+             # Binary target: will a crisis happen within horizon?
+             y_target = ((max_delay > 120.0) | (max_backlog > 80.0)).float().unsqueeze(1)
              
-             self.snapshots.append(data)
-            
-        if len(self.snapshots) > 0:
-             self._compute_and_save_scaler()
-             self._normalize_data()
+             data = Data(x=x_windowed, edge_index=self.edge_index, edge_attr=edge_attr, y=y_target)
+             processed_sequence.append(data)
              
-        print(f"✅ Created {len(self.snapshots)} windowed sequences (Input: T-2..T -> Target: T+1).")
-        
-    def _compute_and_save_scaler(self):
-        """Computes Mean and Std for X and EdgeAttr based on current snapshots."""
-        print("   Computing Scaler Stats...")
-        
-        # Collect all x and edge_attr
-        all_x = torch.cat([data.x for data in self.snapshots], dim=0) # [Total_Nodes, 15]
-        all_edge = torch.cat([data.edge_attr for data in self.snapshots], dim=0) # [Total_Edges, 3]
-        
-        # Compute Stats
-        x_mean = all_x.mean(dim=0).tolist()
-        x_std = all_x.std(dim=0).tolist()
-        
-        e_mean = all_edge.mean(dim=0).tolist()
-        e_std = all_edge.std(dim=0).tolist()
-        
-        # Avoid div by zero
-        x_std = [s if s > 1e-5 else 1.0 for s in x_std]
-        e_std = [s if s > 1e-5 else 1.0 for s in e_std]
-        
-        stats = {
-            "x_mean": x_mean, "x_std": x_std,
-            "edge_mean": e_mean, "edge_std": e_std
-        }
-        
-        self.scaler_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(self.scaler_path, 'w') as f:
-            json.dump(stats, f)
-        print(f"   Scaler saved to {self.scaler_path}")
-        
-    def _normalize_data(self):
-        """Applies normalization to all snapshots in memory."""
-        # Reload stats to be sure (or just use what we computed)
-        with open(self.scaler_path, 'r') as f:
-            stats = json.load(f)
-            
-        x_mean = torch.tensor(stats["x_mean"])
-        x_std = torch.tensor(stats["x_std"])
-        e_mean = torch.tensor(stats["edge_mean"])
-        e_std = torch.tensor(stats["edge_std"])
-        
-        for data in self.snapshots:
-            data.x = (data.x - x_mean) / x_std
-            data.edge_attr = (data.edge_attr - e_mean) / e_std
+        return processed_sequence
+        # NOTE: Normalization is now handled in train.py to allow proper Train-Split-Only fitting
 
     def _create_snapshot(self, group_df: pd.DataFrame) -> Data:
         # Initialize Node Features Matrix [Num_Nodes, Num_Features]
@@ -213,9 +223,10 @@ class SupplyChainGraphDataset:
         # 1: Order Load (Count of events in this bucket)
         # 2: Traffic
         # 3: Weather
-        # 4: Avg Delay (Current bucket) - Safe Feature for predicting Next Bucket Risk
+        # 4: Avg Delay (Current bucket)
+        # 5: Backlog (Pending Orders Count) - EARLY WARNING SIGNAL
         
-        x = torch.zeros((self.num_nodes, 5), dtype=torch.float)
+        x = torch.zeros((self.num_nodes, 6), dtype=torch.float)
         y = torch.zeros((self.num_nodes, 1), dtype=torch.float) # Calculated Risk
         
         # Static Features (Type)
@@ -230,35 +241,55 @@ class SupplyChainGraphDataset:
             x[idx, 0] = type_val
 
         # Dynamic Features (Aggregated from DataFrame group)
-        # Group by Node ID
-        node_groups = group_df.groupby('node_id')
+        node_stats = {} # node_id -> (count, traffic, weather, delay, backlog)
         
-        for node_id, records in node_groups:
-            if node_id not in self.node_mapping: continue
+        groups = group_df.groupby('node_id')
+        
+        # Helper to get stats or default
+        def get_stats(nid):
+            if nid in groups.groups:
+                g = groups.get_group(nid)
+                # Check if backlog column exists (backward compat)
+                backlog = 0.0
+                if 'pending_orders_count' in g.columns:
+                     backlog = g['pending_orders_count'].max() # Use max backlog seen in bucket? Or mean? Max is safer for risk.
+                
+                return (
+                    len(g),
+                    g['traffic_congestion_level'].mean(),
+                    g['weather_condition_severity'].mean(),
+                    g['delivery_time_deviation'].mean(),
+                    backlog
+                )
+            return (0, 0.0, 0.0, 0.0, 0.0)
+
+        for node_id, idx in self.node_mapping.items():
+            count, traf, weath, delay, backlog = get_stats(node_id)
             
-            idx = self.node_mapping[node_id]
+            # Use defaults if NaN
+            if pd.isna(traf): traf = 0.0
+            if pd.isna(weath): weath = 0.0
+            if pd.isna(delay): delay = 0.0
+            if pd.isna(backlog): backlog = 0.0
             
-            # Feature 1: Event Count (Load)
-            count = len(records)
+            node_stats[node_id] = (count, traf, weath, delay, backlog)
+            self.last_delays[node_id] = delay
+        
+        # Pass 3: Fill Tensor
+        for node_id, idx in self.node_mapping.items():
+            count, traf, weath, delay, backlog = node_stats[node_id]
+            
             x[idx, 1] = float(count)
+            x[idx, 2] = float(traf)
+            x[idx, 3] = float(weath)
+            x[idx, 4] = float(delay)
+            x[idx, 5] = float(backlog)
             
-            # Feature 2: High Traffic Flag (Avg of traffic level)
-            avg_traffic = records['traffic_congestion_level'].mean()
-            x[idx, 2] = float(avg_traffic) if not pd.isna(avg_traffic) else 0.0
-
-            # Feature 3: Bad Weather Flag
-            avg_weather = records['weather_condition_severity'].mean()
-            x[idx, 3] = float(avg_weather) if not pd.isna(avg_weather) else 0.0
+            y[idx, 0] = 0.0
             
-            # Feature 4: Avg Delay (Current Performance)
-            avg_delay = records['delivery_time_deviation'].mean()
-            x[idx, 4] = float(avg_delay) if not pd.isna(avg_delay) else 0.0
-
-            # Target Calculation (for this bucket)
-            # This y will be the TARGET for the PREVIOUS bucket in process()
-            # If delay > 60 mins (1h), risk = 1.0, else mapped sigmoidally/linearly
-            risk = 1.0 if avg_delay > 60 else (avg_delay / 60.0 if avg_delay > 0 else 0)
-            y[idx, 0] = float(risk)
+        # Skip original loop logic
+        if False:
+             pass
 
         # Construct Data Object
         data = Data(x=x, edge_index=self.edge_index, y=y)

@@ -257,6 +257,9 @@ class SimulationEngine:
                         node_id=node.id,
                         event_type=EventType.START_SERVICE
                     ))
+                
+                # Check for new work immediately
+                self.dispatcher_logic()
                 return
 
         if truck.route and truck.current_node_index < len(truck.route) - 1:
@@ -344,6 +347,7 @@ class SimulationEngine:
                 truck.status = TruckStatus.EN_ROUTE_TO_DELIVERY
         else:
             truck.status = TruckStatus.IDLE
+            self.dispatcher_logic() # Check for work if idle
 
         truck.previous_status = None
 
