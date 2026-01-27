@@ -46,7 +46,7 @@ import pandas as pd
 import json
 
 def train_gnn():
-    print("🚀 Starting GNN Training Pipeline (Refined Strategy)...")
+    print("Starting GNN Training Pipeline (Refined Strategy)...")
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"   Using Device: {device}")
@@ -57,7 +57,7 @@ def train_gnn():
     
     print(f"   Loading Episodes from: {data_dir}")
     if not data_dir.exists():
-        print("❌ Data directory missing.")
+        print("Data directory missing.")
         return
 
     gb = GraphBuilder()
@@ -73,11 +73,11 @@ def train_gnn():
     
     num_episodes = len(dataset.episodes)
     if num_episodes < 3:
-        print("❌ Not enough episodes.")
+        print("Not enough episodes.")
         return
 
     # --- 1. Audit Target Distribution (Per-Episode) ---
-    print("\n   🔍 Auditing Episodes (Topology & Distribution Check)...")
+    print("\n   Auditing Episodes (Topology & Distribution Check)...")
     
     for i, ep in enumerate(dataset.episodes):
         y_ep = torch.cat([d.y for d in ep]).view(-1).numpy()
@@ -157,11 +157,11 @@ def train_gnn():
     
     # Simplified: No pos_weight (conflict with sampler). 
     # Rely on Sampler to feed balanced batches.
-    print(f"   Balancing: Using WeightedRandomSampler (Deciles).")
+    print(f"Balancing: Using WeightedRandomSampler (Deciles).")
     
     # Bins: 5 fixed intervals [0-0.2, 0.2-0.4, ..., 0.8-1.0]
     counts = torch.histc(train_y, bins=5, min=0, max=1)
-    print(f"     Train Distribution (5 bins): {counts.int().tolist()}")
+    print(f"Train Distribution (5 bins): {counts.int().tolist()}")
     
     # Weights inverse to bin frequency
     bin_weights = 1.0 / (counts + 1.0) 

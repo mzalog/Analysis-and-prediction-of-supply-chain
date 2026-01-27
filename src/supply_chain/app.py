@@ -104,38 +104,54 @@ def load_ai_assets():
 
 @st.cache_resource
 def load_gnn_model():
-    """Loads the trained GNN model."""
+    """Loads the trained GNN model (V2 preferred)."""
     try:
         from supply_chain.gnn.model import SupplyChainGNN
         
         project_root = Path(__file__).parent.parent.parent
-        model_path = project_root / "models" / "supply_chain_gnn.pth"
         
+        # Try V2 (Regression) first
+        model_path_v2 = project_root / "models" / "supply_chain_gnn_v2.pth"
+        scaler_path_v2 = project_root / "models" / "gnn_v2_scaler.json"
+        
+        is_v2 = False
+        model_path = None
+        scaler_path = None
+        
+        if model_path_v2.exists():
+            model_path = model_path_v2
+            scaler_path = scaler_path_v2
+            is_v2 = True
+            print("Loaded GNN V2 (Regression)")
+        else:
+            model_path = project_root / "models" / "supply_chain_gnn.pth"
+            scaler_path = project_root / "models" / "gnn_scaler.json"
+            print("Loaded GNN V1 (Legacy)")
+
         if not model_path.exists():
-            return None
+            return None, None, False
             
-        # Initialize Architecture (Standard params from train.py)
-        # ST-GNN now expects 15 channels (3 steps * 5 features)
+        # Initialize Architecture 
+        # Both V1 and V2 use same architecture, just output differs (logit vs log-delay)
         model = SupplyChainGNN(in_channels=18, hidden_channels=64, out_channels=1)
         model.load_state_dict(torch.load(model_path, map_location=torch.device('cpu')))
         model.eval()
         
         # Load Scaler
-        scaler_path = project_root / "models" / "gnn_scaler.json"
         scaler = None
-        if scaler_path.exists():
+        if scaler_path and scaler_path.exists():
             with open(scaler_path, 'r') as f:
                 scaler = json.load(f)
         else:
-            st.warning("GNN Scaler not found. Inference will be unnormalized (likely poor).")
+            st.warning("GNN Scaler not found. Inference will be unnormalized.")
             
-        return model, scaler
+        return model, scaler, is_v2
     except Exception as e:
         st.error(f"Failed to load GNN Model: {e}")
-        return None, None
+        return None, None, False
 
 model, preprocessor = load_ai_assets()
-gnn_model, gnn_scaler = load_gnn_model()
+gnn_model, gnn_scaler, is_gnn_v2 = load_gnn_model()
 
 
 # --- Helper Functions ---
@@ -628,107 +644,96 @@ def render_pydeck_map(engine, graph_builder, show_gnn_risk=False, test_mode=Fals
                 edge_attr_inf = (edge_attr_inf - em) / es
             
             with torch.no_grad():
-                # Correct call with 15-dim input and edge attributes
-                logits = gnn_model(x_windowed, snapshot.edge_index, edge_attr_inf)
-                raw_probs = torch.sigmoid(logits)
+                out = gnn_model(x_windowed, snapshot.edge_index, edge_attr_inf)
                 
-                # DEBUG: Print raw model output to console
-                print(f"🔍 Raw GNN: {raw_probs.mean().item():.3f} (min={raw_probs.min().item():.3f}, max={raw_probs.max().item():.3f})")
-                
-                # POST-PROCESSING: Calibrate model output for stable demo behavior
-                # Use dynamic baseline from non-sabotaged nodes to avoid drift.
-                overrides = st.session_state.get('node_overrides', {})
-                sorted_nodes = sorted(graph.nodes())
-                sabotage_mask = torch.tensor([
-                    node_id in overrides for node_id in sorted_nodes
-                ], dtype=torch.bool)
-
-                if sabotage_mask.any():
-                    baseline = raw_probs[~sabotage_mask].median().item() if (~sabotage_mask).any() else raw_probs.median().item()
-                    crisis = raw_probs[sabotage_mask].median().item()
+                # Logic Fork based on Model Type
+                if is_gnn_v2:
+                    # V2: Regression (Output = Log-Delay)
+                    # Convert log1p(y) -> expm1(out) -> minutes
+                    pred_delay = torch.expm1(out.clamp(min=0.0)) # [N, 1]
+                    
+                    # Store for visualization
+                    current_risks = {}
+                    sorted_nodes = sorted(graph.nodes())
+                    for i, val_tensor in enumerate(pred_delay):
+                        node_id = sorted_nodes[i]
+                        val = val_tensor.item()
+                        current_risks[node_id] = val
+                        
+                    print(f"🔍 GNN V2 Delay: Max={pred_delay.max().item():.1f} min")
+                    
                 else:
+                    # V1: Classification (Output = Logits)
+                    raw_probs = torch.sigmoid(out)
+                    
+                    # --- Legacy Calibration & Normalization (V1 Only) ---
+                    overrides = st.session_state.get('node_overrides', {})
+                    sorted_nodes = sorted(graph.nodes())
+                    
+                    # Normalize Probabilities
                     baseline = raw_probs.median().item()
-                    crisis = baseline + 0.15
+                    denom = max(0.05, (baseline + 0.15) - baseline) # Pseudo-scaling
+                    
+                    risk_scores = (raw_probs - baseline) / denom
+                    risk_scores = torch.clamp(risk_scores, 0.0, 1.0)
+                    
+                    # Demo Boost
+                    for i, node_id in enumerate(sorted_nodes):
+                        if node_id in overrides:
+                            risk_scores[i] = max(risk_scores[i].item(), 0.85)
+                            
+                    current_risks = {}
+                    for i, val_tensor in enumerate(risk_scores):
+                         current_risks[sorted_nodes[i]] = val_tensor.item()
+                         
+                    print(f"🔍 GNN V1 Risk: Max={risk_scores.max().item():.2f}")
 
-                # Normalize to [0,1] with a target neutral baseline
-                target_baseline = 0.15
-                denom = max(0.05, crisis - baseline)
-                risk_scores = (raw_probs - baseline) / denom
-                risk_scores = torch.clamp(risk_scores, 0.0, 1.0)
-                risk_scores = risk_scores * (1.0 - target_baseline) + target_baseline
-
-                print(
-                    f"📊 Calibrated: {risk_scores.mean().item():.3f} "
-                    f"(baseline={baseline:.3f}, crisis={crisis:.3f})"
-                )
-                
-            # DEMO BOOST: Directly boost sabotaged nodes for guaranteed visibility
-            overrides = st.session_state.get('node_overrides', {})
-            sorted_nodes = sorted(graph.nodes())
-            for i, node_id in enumerate(sorted_nodes):
-                if node_id in overrides:
-                    # Force high risk score for sabotaged nodes
-                    risk_scores[i] = max(risk_scores[i].item(), 0.85)
-            
-            # --- EMA & Top-K Logic ---
-            if 'risk_ema' not in st.session_state:
-                st.session_state.risk_ema = {}
-            
-            # 1. Update EMA
-            current_risks = {}
-            for i, score in enumerate(risk_scores):
-                node_id = sorted(graph.nodes())[i] # Deterministic order
-                val = score.item()
-                
-                prev = st.session_state.risk_ema.get(node_id, val)
-                # EMA: 0.4 History + 0.6 Current (Faster response for demo)
-                new_val = 0.4 * prev + 0.6 * val
-                st.session_state.risk_ema[node_id] = new_val
-                current_risks[node_id] = new_val
-                
-            # 2. Determine Top-K Threshold (e.g. Top 5 risky nodes for demo clarity)
-            all_vals = sorted(current_risks.values(), reverse=True)
-            k = min(5, len(all_vals))  # Reduced for sharper hotspots
-            top_k_thresh = all_vals[k-1] if k > 0 else 0.0
-            # Lower floor for more sensitive detection in demo
-            final_thresh = max(0.3, top_k_thresh)
-            
-            # 3. Update Visuals
+            # --- Update Heatmap Layer ---
             gnn_data = []
-            # Create quick lookup for nodes_data to update colors
+            
+            # Helper for color intensity (Shared Logic)
             visual_node_map = {n['id']: n for n in nodes_data}
             
             for node_id, risk_val in current_risks.items():
                 node = graph.nodes[node_id]['data']
                 
-                # Apply Threshold for "Hotspot" effect
-                is_hotspot = risk_val >= final_thresh
+                # V2 vs V1 Visual thresholds
+                if is_gnn_v2:
+                    # Delay Thresholds: 15 min (Warn), 60 min (Critical)
+                    is_hotspot = risk_val > 15.0
+                    display_text = f"{risk_val:.0f} min"
+                    
+                    # Normalize for heatmap weight (0-1)
+                    # Low delays (1-10 min) will be faint but visible
+                    weight = min(max(risk_val / 60.0, 0.2), 1.0) 
+                    if risk_val < 1.0: weight = 0.0 # Ignore <1 min noise
+                    
+                else:
+                    # Risk Score (0-1)
+                    is_hotspot = risk_val > 0.6
+                    display_text = f"{risk_val:.2f}"
+                    weight = risk_val if risk_val > 0.2 else 0.0
                 
-                # Update Icon Color (Directly in nodes_data used by Scatterplot)
-                if node_id in visual_node_map:
-                    if is_hotspot:
-                        # Red Intensity based on risk
-                        intensity = int(255 * risk_val)
-                        visual_node_map[node_id]['color'] = [255, 255 - intensity, 255 - intensity]
-                        visual_node_map[node_id]['radius'] = 6000 # Enlarge
-                    else:
-                        # Revert/Default (Gray-ish or Type Color if needed, but here we dim non-risky)
-                        # Actually better to leave Type Color or dim it? 
-                        # User wants Hotspots. Let's leave original Type color for context, or dim?
-                        # Let's leave original for now, only override if Risk is High.
-                        pass
+                # Visual Feedback on Nodes (Red Tint)
+                if is_hotspot and node_id in visual_node_map:
+                    # Intensity logic
+                    intensity_factor = min(1.0, weight)
+                    # Tint red
+                    visual_node_map[node_id]['color'] = [255, int(255 * (1-intensity_factor)), int(255 * (1-intensity_factor))]
+                    visual_node_map[node_id]['radius'] = 6000
                 
-                # Add to Heatmap only if significant
-                if risk_val > 0.1: 
-                    gnn_data.append({
+                # Heatmap Data
+                if weight > 0.1:
+                     gnn_data.append({
                         "lon": node.lon,
                         "lat": node.lat,
-                        "weight": risk_val if is_hotspot else risk_val * 0.3, # Suppress non-hotspot weight
-                        "risk": f"{risk_val:.2f}"
+                        "weight": weight,
+                        "risk": display_text
                     })
-                
+
             layers.append(pdk.Layer(
                 "HeatmapLayer",
+
                 gnn_data,
                 get_position=["lon", "lat"],
                 get_weight="weight",
@@ -825,7 +830,7 @@ if st.session_state.last_graph_source != graph_source:
 st.session_state.num_trucks = st.sidebar.slider("Number of Trucks", 5, 30, 20)
 sim_speed = st.sidebar.slider("Simulation Speed (steps/frame)", 1, 10, 2)
 
-show_gnn_risk = st.sidebar.checkbox("👁️ Show AI Spatial Risk (GNN)", value=False)
+show_gnn_risk = st.sidebar.checkbox("👁️ Show AI Spatial Risk (GNN)", value=True)
 
 # --- GNN Debug Tools ---
 with st.sidebar.expander("🛠️ GNN Debug / Interpretation", expanded=False):
