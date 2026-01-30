@@ -41,6 +41,6 @@ texput.log
 reports/
 
 # Reference materials / templates (not required to run the project)
-hpc_assignment-master/
+data/raw/*
 
 src/supply_chain.egg-info/data/raw/simulated_supply_chain_data_2021_2025.csv
