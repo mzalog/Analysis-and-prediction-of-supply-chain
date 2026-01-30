@@ -4,12 +4,12 @@ from pathlib import Path
 import numpy as np
 
 # Add src to sys.path
-project_root = Path(__file__).resolve().parent
+project_root = Path(__file__).resolve().parent.parent
 src_path = project_root / "src"
 if str(src_path) not in sys.path:
     sys.path.append(str(src_path))
 
-from supply_chain.gnn.model import SupplyChainGNN
+from supply_chain.models.gnn import SupplyChainGNN
 import torch
 import json
 

@@ -17,10 +17,9 @@ from torch_geometric.loader import DataLoader
 from sklearn.metrics import average_precision_score
 import sys
 
-sys.path.insert(0, str(Path(__file__).parent / "src"))
-
-from supply_chain.gnn.model import SupplyChainGNN
-from supply_chain.gnn.dataset import SupplyChainGraphDataset
+sys.path.append(str(Path(__file__).resolve().parent.parent / "src"))
+from supply_chain.models.gnn import SupplyChainGNN
+from supply_chain.data.dataset_gnn import SupplyChainGraphDataset
 from supply_chain.simulation.graph import GraphBuilder
 
 
@@ -46,7 +45,7 @@ def main():
     # Build graph
     print("\n📊 Building graph...")
     gb = GraphBuilder()
-    map_path = project_root / "kroA100.txt"
+    map_path = project_root / "data" / "kroA100.txt"
     if map_path.exists():
         gb.create_from_tsplib(map_path, k_neighbors=6)
         print(f"   Loaded TSPLIB graph: {len(gb.nodes)} nodes")

@@ -3,6 +3,11 @@ __pycache__/
 *.py[cod]
 *.pyo
 
+# Tool caches
+.pytest_cache/
+.ruff_cache/
+.streamlit/
+
 # Virtualenv
 .venv/
 
@@ -21,6 +26,21 @@ data/processed/
 .DS_Store
 Thumbs.db
 
+# LaTeX build artifacts
+*.aux
+*.bbl
+*.blg
+*.fdb_latexmk
+*.fls
+*.log
+*.out
+*.synctex.gz
+*.toc
+texput.log
+
 reports/
+
+# Reference materials / templates (not required to run the project)
+hpc_assignment-master/
 
 src/supply_chain.egg-info/

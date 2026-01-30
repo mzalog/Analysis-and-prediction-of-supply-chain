@@ -16,9 +16,10 @@ import numpy as np
 import pydeck as pdk
 import hashlib
 
-# Add src to path so we can import supply_chain package
+# Ensure the project src directory is importable when running via Streamlit.
 current_dir = os.path.dirname(os.path.abspath(__file__))
-src_dir = os.path.dirname(current_dir)
+# src/supply_chain/app -> src is 2 levels up
+src_dir = str(Path(current_dir).resolve().parents[1]) # parents[0] is supply_chain, parents[1] is src
 if src_dir not in sys.path:
     sys.path.append(src_dir)
 
@@ -27,9 +28,12 @@ from supply_chain.simulation.engine import SimulationEngine
 from supply_chain.simulation.schema import Event, EventType, NodeType, TruckStatus
 from supply_chain.simulation.visualization import SimulationVisualizer
 from supply_chain.simulation.integration import DataConverter, StatsCalibrator
-from supply_chain.model.network import SupplyChainNet
+from supply_chain.models.mlp import SupplyChainNet
+from supply_chain.models.gnn import SupplyChainGNN
+from supply_chain.models.inference import get_current_graph_snapshot
 from supply_chain.data.preprocessing import TabularPreprocessor, PreprocessingConfig
 from supply_chain.config import DatasetSchema, REPORTS_DIR
+from supply_chain.app.components.map import render_pydeck_map
 
 # Page Config
 st.set_page_config(
@@ -64,24 +68,28 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-    # --- AI Loading ---
+# --- Model loading (MLP + GNN) ---
 @st.cache_resource
 def load_ai_assets():
     """Loads the trained MLP model and fits the preprocessor on historical data."""
     try:
-        # Data still in experiments folder for fitting preprocessor
-        # Data still in experiments folder for fitting preprocessor
-        project_root = Path(__file__).parent.parent.parent
-        data_path = project_root / "data" / "raw" / "simulated_supply_chain_data_2021_2025.csv"
-        
-        # Model moved to models/
-        # Adjust path relative to project root or use absolute logic if needed
-        # Assuming app.py is run from project root or src is in path
-        project_root = Path(__file__).parent.parent.parent
+        # src/supply_chain/app/main.py -> project root is 3 levels up
+        project_root = Path(__file__).resolve().parents[3]
+        raw_dir = project_root / "data" / "raw"
         model_path = project_root / "models" / "supply_chain_mlp.pth"
+
+        candidate_data_paths = [
+            raw_dir / "simulated_supply_chain_data_2021_2025.csv",
+            raw_dir / "simulated_supply_chain_data.csv",
+            raw_dir / "dynamic_supply_chain_logistics_dataset.csv",
+        ]
+        data_path = next((p for p in candidate_data_paths if p.exists()), None)
         
-        if not data_path.exists() or not model_path.exists():
-            st.error(f"Missing assets: Data={data_path.exists()}, Model={model_path.exists()}")
+        if data_path is None or not model_path.exists():
+            st.error(
+                "Missing assets: Data=%s, Model=%s"
+                % (data_path is not None, model_path.exists())
+            )
             return None, None
             
         # 1. Fit Preprocessor
@@ -106,9 +114,7 @@ def load_ai_assets():
 def load_gnn_model():
     """Loads the trained GNN model (V2 preferred)."""
     try:
-        from supply_chain.gnn.model import SupplyChainGNN
-        
-        project_root = Path(__file__).parent.parent.parent
+        project_root = Path(__file__).resolve().parents[3]
         
         # Try V2 (Regression) first
         model_path_v2 = project_root / "models" / "supply_chain_gnn_v2.pth"
@@ -122,17 +128,14 @@ def load_gnn_model():
             model_path = model_path_v2
             scaler_path = scaler_path_v2
             is_v2 = True
-            print("Loaded GNN V2 (Regression)")
         else:
             model_path = project_root / "models" / "supply_chain_gnn.pth"
             scaler_path = project_root / "models" / "gnn_scaler.json"
-            print("Loaded GNN V1 (Legacy)")
 
         if not model_path.exists():
             return None, None, False
             
         # Initialize Architecture 
-        # Both V1 and V2 use same architecture, just output differs (logit vs log-delay)
         model = SupplyChainGNN(in_channels=18, hidden_channels=64, out_channels=1)
         model.load_state_dict(torch.load(model_path, map_location=torch.device('cpu')))
         model.eval()
@@ -219,10 +222,10 @@ def init_simulation():
             st.session_state.graph_builder = gb
             st.session_state.simulation_time = 0.0
             st.session_state.running = False
-
-    # Initialize simple calibrator for inference context
+            
+            # Initialize simple calibrator for inference context
             st.session_state.calibrator = StatsCalibrator() # Uses default
-
+            
             # Reset GNN History on simulation reset
             if 'gnn_history' in st.session_state:
                 del st.session_state.gnn_history
@@ -251,539 +254,6 @@ def reset_simulation():
     init_simulation()
 
 # Initialize Simulation State
-init_simulation()
-
-def compute_edge_attrs(graph, node_mapping, current_time_min):
-    """
-    Computes dynamic edge attributes [Dist, Traffic, Weather] for GNN.
-    Matches logic in dataset.py.
-    """
-    edge_attrs = []
-    # Iterate exactly as edge_index is built (source-major, then undirected dup)
-    # But wait, edge_index must align with this list. 
-    # To be safe, we iterate sorted edges or store map? 
-    # PyG convention: edge_attr row i corresponds to edge_index col i.
-    # We must ensure loop order is IDENTICAL to edge_index construction.
-    
-    # We will return list of lists, caller converts to tensor.
-    
-    # Helper noise 
-    time_h = current_time_min / 60.0
-    def noise(lat, lon, t):
-        val = math.sin(lon/5.0 + t/24.0) + math.cos(lat/5.0 + t/48.0)
-        return (val + 2.0) / 4.0
-
-    # Must match get_current_graph_snapshot's edge iteration order!
-    # It iterates: for u, v in sorted(graph.edges()):
-    # So we do the same.
-    
-    for u, v in sorted(graph.edges()):
-        if u in node_mapping and v in node_mapping:
-            src_node = graph.nodes[u]['data']
-            dst_node = graph.nodes[v]['data']
-            
-            dist = ((src_node.lat - dst_node.lat)**2 + (src_node.lon - dst_node.lon)**2) ** 0.5
-            dist_norm = dist / 10.0
-            
-            w_src = noise(src_node.lat, src_node.lon, time_h)
-            w_dst = noise(dst_node.lat, dst_node.lon, time_h)
-            weather = (w_src + w_dst) / 2.0
-            
-            t_src = noise(src_node.lat+10, src_node.lon+10, time_h)
-            t_dst = noise(dst_node.lat+10, dst_node.lon+10, time_h)
-            traffic = (t_src + t_dst) / 2.0
-            
-            # Forward Edge
-            edge_attrs.append([dist_norm, traffic, weather])
-            # Backward Edge
-            edge_attrs.append([dist_norm, traffic, weather])
-            
-    return torch.tensor(edge_attrs, dtype=torch.float)
-
-def get_current_graph_snapshot(engine, graph_builder, test_mode=False):
-    """
-    Extracts current simulation state into a PyG Data object for GNN inference.
-    Uses REAL simulation state (queues, history) and DETERMINISTIC environment factors.
-    Args:
-        test_mode (bool): If True, suppresses random traffic/weather on non-sabotaged nodes for clean signal verification.
-    """
-    from torch_geometric.data import Data
-    
-    
-    graph = graph_builder.graph
-    # CRITICAL: Sort nodes by ID to ensure alignment across partial snapshots!
-    sorted_nodes = sorted(graph.nodes())
-    node_mapping = {n: i for i, n in enumerate(sorted_nodes)}
-    num_nodes = len(sorted_nodes)
-    
-    # 1. Edge Index
-    src, dst = [], []
-    # Ensure consistent iteration order with compute_edge_attrs
-    for u, v in sorted(graph.edges()): 
-        if u in node_mapping and v in node_mapping:
-            src.append(node_mapping[u])
-            dst.append(node_mapping[v])
-            src.append(node_mapping[v]) # Undirected for message passing
-            dst.append(node_mapping[u])
-    edge_index = torch.tensor([src, dst], dtype=torch.long)
-    
-    # 1.5 Edge Attrs
-    edge_attr = compute_edge_attrs(graph, node_mapping, engine.current_time)
-    if test_mode:
-        # Stabilize GNN inputs in demo/test mode
-        edge_attr = torch.zeros_like(edge_attr)
-    
-    # 2. Node Features [Num_Nodes, 6]
-    # Features: [Type, Load, Traffic, Weather, Delay, Backlog]
-    x = torch.zeros((num_nodes, 6), dtype=torch.float)
-    
-    # Helper for Delay Stat (Average service time of last N completed events)
-    # This is expensive if history is huge, but fine for demo scale.
-    node_delays = {}
-    for ev in reversed(engine.processed_events[-500:]): # Look at last 500 events
-        if ev.event_type == EventType.END_SERVICE and ev.node_id in node_mapping:
-            if ev.node_id not in node_delays:
-                node_delays[ev.node_id] = []
-            node_delays[ev.node_id].append(ev.details.get("service_duration", 0.0))
-    
-    for node_id, idx in node_mapping.items():
-        node_data = graph.nodes[node_id]['data']
-        
-        # Feature 0: Type
-        type_val = 0
-        if node_data.type == NodeType.WAREHOUSE: type_val = 1
-        elif node_data.type == NodeType.HUB: type_val = 2
-        elif node_data.type == NodeType.PORT: type_val = 3
-        elif node_data.type == NodeType.CUSTOMER: type_val = 4
-        x[idx, 0] = type_val
-        
-        # Feature 1: Load (Orders currently ASSIGNED/Moving from this node)
-        # Optimized: Check trucks originating here? 
-        # Fallback to simple scan for now
-        load = sum(1 for o in engine.orders.values() if o.origin_node_id == node_id and o.status == "ASSIGNED")
-        x[idx, 1] = float(load)
-        
-        # Feature 5: Backlog (Pending Orders waiting at this node)
-        # Use pending_orders list
-        backlog = sum(1 for oid in engine.pending_orders if engine.orders[oid].origin_node_id == node_id)
-        x[idx, 5] = float(backlog)
-        
-        # Feature 4: Current Delays / Congestion (Calculate BASELINE first)
-        # Metric: Average Service Time + Queue Penalty
-        recent_times = node_delays.get(node_id, [])
-        avg_svc = sum(recent_times) / len(recent_times) if recent_times else 0.0
-        
-        # Queue penalty: If queue is long, "delay expectation" rises
-        queue_len = len(node_data.queue)
-        # Heuristic: Delay = Avg Service + (Queue * 5 mins)
-        estimated_delay = avg_svc + (queue_len * 5.0)
-
-        # Feature 2 & 3: Context (Deterministic or Override)
-        # Check for manual overrides ("Sabotage")
-        overrides = st.session_state.get('node_overrides', {})
-        
-        if node_id in overrides:
-             # User sabotaged this node! 
-             # Force High Traffic (Feature 2) - amplified for demo
-             x[idx, 2] = overrides[node_id].get('traffic', 0.5) * 15.0 
-             # Force High Weather Severity (Feature 3)
-             x[idx, 3] = overrides[node_id].get('weather', 0.5) * 2.0
-             
-             # CRITICAL: Strong signal injection for demo visibility
-             # Inject high values directly (not additive, to ensure signal)
-             x[idx, 1] = 20.0   # Load = busy
-             x[idx, 4] = 120.0  # Delay = 2 hours
-             x[idx, 5] = 150.0  # Backlog = 150 orders stuck
-                 
-        else:
-            # Deterministic Seeding based on Node + Time (Hour)
-            # This ensures stable predictions within the same simulation hour
-            # Use stable hash for seeding instead of hash()
-            node_hash = int(hashlib.md5(str(node_id).encode()).hexdigest(), 16)
-            seed_val = node_hash + int(engine.current_time / 60.0)
-            
-            # Use private RNG instance to avoid polluting global random state
-            rng = random.Random(seed_val)
-            
-            if test_mode:
-                # 🧪 Test Mode: FULLY IDEAL Conditions
-                # Zero out ALL dynamic features for clean baseline
-                x[idx, 1] = 0.0  # Load = 0
-                x[idx, 2] = 0.0  # Traffic = 0
-                x[idx, 3] = 0.0  # Weather = 0
-                x[idx, 4] = 0.0  # Delay = 0
-                x[idx, 5] = 0.0  # Backlog = 0
-                # Only Type (Feature 0) remains as real value
-            else:
-                # Simulate "Live" Traffic/Weather
-                traffic_sim = rng.uniform(0, 10)
-                weather_sim = rng.uniform(0, 1)
-                
-                x[idx, 2] = float(traffic_sim)
-                x[idx, 3] = float(weather_sim)
-                
-                # Normal delay estimation
-                x[idx, 4] = float(estimated_delay)
-        
-    return Data(x=x, edge_index=edge_index, edge_attr=edge_attr)
-
-
-def render_pydeck_map(engine, graph_builder, show_gnn_risk=False, test_mode=False):
-    """Render the graph using PyDeck and handle GNN History/Inference."""
-    graph = graph_builder.graph
-    
-    # Initialize History Buffer if needed
-    if 'gnn_history' not in st.session_state:
-         # Deque of tensors [Num_Nodes, 5]
-         st.session_state.gnn_history = []
-
-    # ... (Atlas loading omitted) ...
-    
-    # --- Prepare Data for Layers ---
-    
-    # 1. Nodes Data
-    nodes_data = []
-    # Styles mapping to RGB colors (Distinct from Truck Status colors)
-    styles = {
-        NodeType.WAREHOUSE: [138, 43, 226],    # BlueViolet
-        NodeType.CUSTOMER: [255, 215, 0],      # Gold
-        NodeType.HUB: [255, 140, 0],           # DarkOrange 
-        NodeType.PORT: [0, 255, 255],          # Cyan
-        NodeType.INSPECTION: [255, 105, 180]   # HotPink
-    }
-    
-    for node_id in graph.nodes():
-        node = graph.nodes[node_id]['data']
-        color = styles.get(node.type, [128, 128, 128])
-        
-        pending_count = 0
-        for oid in engine.pending_orders:
-            if engine.orders[oid].origin_node_id == node_id:
-                pending_count += 1
-                
-        nodes_data.append({
-            "id": node_id,
-            "type": node.type.value if hasattr(node.type, "value") else str(node.type),
-            "lon": node.lon,
-            "lat": node.lat,
-            "color": color,
-            "radius": 5000 if node.type in [NodeType.HUB, NodeType.PORT] else 3000,
-            "pending": str(pending_count) if pending_count > 0 else "",
-        })
-        
-    # 2. Edges Data
-    edges_data = []
-    for u, v, data in graph.edges(data=True):
-        u_node = graph.nodes[u]['data']
-        v_node = graph.nodes[v]['data']
-        edges_data.append({
-            "source": [u_node.lon, u_node.lat],
-            "target": [v_node.lon, v_node.lat],
-            "color": [100, 100, 100, 100] 
-        })
-
-    # 3. Trucks Data
-    trucks_data = []
-    status_colors = {
-        TruckStatus.IDLE: [128, 128, 128],
-        TruckStatus.EN_ROUTE_TO_PICKUP: [0, 0, 255],
-        TruckStatus.EN_ROUTE_TO_DELIVERY: [0, 255, 0],
-        TruckStatus.RESTING: [255, 0, 0]
-    }
-    
-    for truck in engine.trucks.values():
-        lon, lat = 0.0, 0.0
-        
-        if truck.current_node_id in graph.nodes:
-            start_node = graph.nodes[truck.current_node_id]['data']
-            lon, lat = start_node.lon, start_node.lat
-            
-            if truck.current_leg_duration > 0 and truck.route and truck.current_node_index < len(truck.route):
-                end_node_id = truck.route[truck.current_node_index]
-                if end_node_id in graph.nodes:
-                    end_node = graph.nodes[end_node_id]['data']
-                    elapsed = engine.current_time - truck.current_leg_start_time
-                    t = elapsed / truck.current_leg_duration
-                    t = max(0.0, min(1.0, t))
-                    lon = start_node.lon + (end_node.lon - start_node.lon) * t
-                    lat = start_node.lat + (end_node.lat - start_node.lat) * t
-        
-        offset_seed = int(truck.id[1:]) if truck.id[1:].isdigit() else hash(truck.id)
-        lon_offset = (offset_seed % 5 - 2) * 0.005
-        lat_offset = (offset_seed % 7 - 3) * 0.005
-        lon += lon_offset
-        lat += lat_offset
-        
-        trucks_data.append({
-            "id": truck.id,
-            "lon": lon,
-            "lat": lat,
-            "color": status_colors.get(truck.status, [255, 255, 255]),
-            "status": truck.status.value,
-            "icon": "🚚"
-        })
-
-    # --- Layers ---
-    layers = [
-        pdk.Layer(
-            "LineLayer",
-            edges_data,
-            get_source_position="source",
-            get_target_position="target",
-            get_color="color",
-            get_width=2,
-            pickable=False,
-        ),
-        pdk.Layer(
-            "ScatterplotLayer",
-            nodes_data,
-            get_position=["lon", "lat"],
-            get_color="color",
-            get_radius="radius",
-            pickable=True,
-            auto_highlight=True,
-            opacity=0.8,
-            radius_min_pixels=8,  
-            radius_max_pixels=20,
-        ),
-        pdk.Layer(
-            "TextLayer",
-            nodes_data,
-            get_position=["lon", "lat"],
-            get_text="type",
-            get_color=[200, 200, 200],
-            get_size=12,
-            get_pixel_offset=[0, 20]
-        ),
-        pdk.Layer(
-            "TextLayer",
-            nodes_data,
-            get_position=["lon", "lat"],
-            get_text="pending",
-            get_color=[255, 255, 255],
-            get_size=14,
-            get_background_color=[255, 0, 0],
-            font_weight="bold",
-            get_pixel_offset=[15, -15]
-        ),
-        pdk.Layer(
-            "ScatterplotLayer",
-            trucks_data,
-            get_position=["lon", "lat"],
-            get_color="color",
-            get_radius=4000, 
-            pickable=True,
-            opacity=0.5,
-        ),
-        pdk.Layer(
-            "TextLayer",
-            trucks_data,
-            get_position=["lon", "lat"],
-            get_text="icon",
-            get_size=25,
-            pickable=True,
-        ),
-        pdk.Layer(
-            "TextLayer",
-            trucks_data,
-            get_position=["lon", "lat"],
-            get_text="id",
-            get_color=[255, 255, 255],
-            get_size=10,
-            get_pixel_offset=[0, 18]
-        )
-    ]
-    
-    # --- GNN Visualization Layer ---
-    if show_gnn_risk:
-        if gnn_model:
-            # Inference
-            # Inference
-            snapshot = get_current_graph_snapshot(engine, graph_builder, test_mode=test_mode)
-            
-            # HISTORY MANAGEMENT
-            history = st.session_state.gnn_history
-            
-            # Add current features to history
-            # Clone to detach from graph changes if any (though x is new tensor)
-            history.append(snapshot.x)
-            
-            # Maintain max size 3
-            if len(history) > 3:
-                history.pop(0)
-            
-            # Prepare Stacked Input
-            # If we don't have 3 steps yet, pad with the oldest available
-            # e.g. [T0] -> [T0, T0, T0]
-            # [T0, T1] -> [T0, T0, T1]
-            input_stack = []
-            if len(history) == 0:
-                 # Should not happen as we just appended
-                 input_stack = [snapshot.x] * 3
-            elif len(history) == 1:
-                 input_stack = [history[0]] * 3
-            elif len(history) == 2:
-                 input_stack = [history[0], history[0], history[1]]
-            else:
-                 input_stack = list(history) # [t-2, t-1, t]
-                 
-            # Concatenate features [Num_Nodes, 18]
-            x_windowed = torch.cat(input_stack, dim=1)
-            edge_attr_inf = snapshot.edge_attr
-            
-            # NORMALIZATION
-            if gnn_scaler:
-                # x [N, 15]
-                xm = torch.tensor(gnn_scaler["x_mean"])
-                xs = torch.tensor(gnn_scaler["x_std"])
-                x_windowed = (x_windowed - xm) / xs
-                
-                # edge [E, 3]
-                em = torch.tensor(gnn_scaler["edge_mean"])
-                es = torch.tensor(gnn_scaler["edge_std"])
-                edge_attr_inf = (edge_attr_inf - em) / es
-            
-            with torch.no_grad():
-                out = gnn_model(x_windowed, snapshot.edge_index, edge_attr_inf)
-                
-                # Logic Fork based on Model Type
-                if is_gnn_v2:
-                    # V2: Regression (Output = Log-Delay)
-                    # Convert log1p(y) -> expm1(out) -> minutes
-                    pred_delay = torch.expm1(out.clamp(min=0.0)) # [N, 1]
-                    
-                    # Store for visualization
-                    current_risks = {}
-                    sorted_nodes = sorted(graph.nodes())
-                    for i, val_tensor in enumerate(pred_delay):
-                        node_id = sorted_nodes[i]
-                        val = val_tensor.item()
-                        current_risks[node_id] = val
-                        
-                    print(f"🔍 GNN V2 Delay: Max={pred_delay.max().item():.1f} min")
-                    
-                else:
-                    # V1: Classification (Output = Logits)
-                    raw_probs = torch.sigmoid(out)
-                    
-                    # --- Legacy Calibration & Normalization (V1 Only) ---
-                    overrides = st.session_state.get('node_overrides', {})
-                    sorted_nodes = sorted(graph.nodes())
-                    
-                    # Normalize Probabilities
-                    baseline = raw_probs.median().item()
-                    denom = max(0.05, (baseline + 0.15) - baseline) # Pseudo-scaling
-                    
-                    risk_scores = (raw_probs - baseline) / denom
-                    risk_scores = torch.clamp(risk_scores, 0.0, 1.0)
-                    
-                    # Demo Boost
-                    for i, node_id in enumerate(sorted_nodes):
-                        if node_id in overrides:
-                            risk_scores[i] = max(risk_scores[i].item(), 0.85)
-                            
-                    current_risks = {}
-                    for i, val_tensor in enumerate(risk_scores):
-                         current_risks[sorted_nodes[i]] = val_tensor.item()
-                         
-                    print(f"🔍 GNN V1 Risk: Max={risk_scores.max().item():.2f}")
-
-            # --- Update Heatmap Layer ---
-            gnn_data = []
-            
-            # Helper for color intensity (Shared Logic)
-            visual_node_map = {n['id']: n for n in nodes_data}
-            
-            for node_id, risk_val in current_risks.items():
-                node = graph.nodes[node_id]['data']
-                
-                # V2 vs V1 Visual thresholds
-                if is_gnn_v2:
-                    # Delay Thresholds: 15 min (Warn), 60 min (Critical)
-                    is_hotspot = risk_val > 15.0
-                    display_text = f"{risk_val:.0f} min"
-                    
-                    # Normalize for heatmap weight (0-1)
-                    # Low delays (1-10 min) will be faint but visible
-                    weight = min(max(risk_val / 60.0, 0.2), 1.0) 
-                    if risk_val < 1.0: weight = 0.0 # Ignore <1 min noise
-                    
-                else:
-                    # Risk Score (0-1)
-                    is_hotspot = risk_val > 0.6
-                    display_text = f"{risk_val:.2f}"
-                    weight = risk_val if risk_val > 0.2 else 0.0
-                
-                # Visual Feedback on Nodes (Red Tint)
-                if is_hotspot and node_id in visual_node_map:
-                    # Intensity logic
-                    intensity_factor = min(1.0, weight)
-                    # Tint red
-                    visual_node_map[node_id]['color'] = [255, int(255 * (1-intensity_factor)), int(255 * (1-intensity_factor))]
-                    visual_node_map[node_id]['radius'] = 6000
-                
-                # Heatmap Data
-                if weight > 0.1:
-                     gnn_data.append({
-                        "lon": node.lon,
-                        "lat": node.lat,
-                        "weight": weight,
-                        "risk": display_text
-                    })
-
-            layers.append(pdk.Layer(
-                "HeatmapLayer",
-
-                gnn_data,
-                get_position=["lon", "lat"],
-                get_weight="weight",
-                radius_pixels=80,      # "Smuga" effect radius
-                intensity=1.5,
-                threshold=0.05,        # Filter low risk noise
-                opacity=0.6,
-                # Gradient: Transparent -> Red
-                color_range=[
-                    [255, 255, 178],   # Light Yellow
-                    [254, 204, 92],
-                    [253, 141, 60],
-                    [240, 59, 32],
-                    [189, 0, 38]       # Deep Red
-                ]
-            ))
-        else:
-            # Cannot show warning easily in map renderer, avoiding side effects
-            pass
-
-    lats = [n['lat'] for n in nodes_data]
-    lons = [n['lon'] for n in nodes_data]
-    center_lat = sum(lats) / len(lats) if lats else 50.0
-    center_lon = sum(lons) / len(lons) if lons else 19.0
-
-    if lats and lons:
-        min_lat, max_lat = min(lats), max(lats)
-        min_lon, max_lon = min(lons), max(lons)
-        lat_span = max(max_lat - min_lat, 0.1)
-        lon_span = max(max_lon - min_lon, 0.1)
-        max_span = max(lat_span, lon_span)
-        zoom = 9.5 - math.log2(max_span)
-    else:
-        zoom = 6
-
-    view_state = pdk.ViewState(
-        latitude=center_lat,
-        longitude=center_lon,
-        zoom=zoom,
-        pitch=0,
-    )
-
-    return pdk.Deck(
-        layers=layers,
-        initial_view_state=view_state,
-        tooltip={"text": "{id}\n{type}\n{status}\nRisk: {risk}"}, # Added Risk to tooltip
-        map_style="mapbox://styles/mapbox/dark-v10"
-    )
-
-# --- Initialize Simulation (Before UI) ---
 init_simulation()
 engine = st.session_state.engine
 graph_builder = st.session_state.graph_builder # Use full name for clarity
@@ -838,7 +308,11 @@ with st.sidebar.expander("🛠️ GNN Debug / Interpretation", expanded=False):
     if st.button("Run Permutation Test"):
         if gnn_model and 'engine' in st.session_state:
             with st.spinner("Running Permutation Test..."):
-                snap = get_current_graph_snapshot(st.session_state.engine, st.session_state.graph_builder)
+                snap = get_current_graph_snapshot(
+                    st.session_state.engine, 
+                    st.session_state.graph_builder,
+                    node_overrides=st.session_state.get('node_overrides', {})
+                )
                 
                 # 1. Normal Prediction
                 # We need history... for test let's fake it with duplicates (Cold Start)
@@ -1043,7 +517,16 @@ with tabs[0]:
         c4.metric("Cancelled", len(cancelled))
         c5.metric("Active Trucks", f"{active_trucks}/{len(engine.trucks)}")
         
-        deck = render_pydeck_map(engine, gb, show_gnn_risk, test_mode=test_mode)
+        deck = render_pydeck_map(
+            engine, 
+            gb, 
+            gnn_model=gnn_model, 
+            gnn_scaler=gnn_scaler, 
+            is_gnn_v2=is_gnn_v2, 
+            show_gnn_risk=show_gnn_risk, 
+            test_mode=test_mode,
+            node_overrides=st.session_state.get('node_overrides', {})
+        )
         if "view_state" in st.session_state:
             deck.initial_view_state = st.session_state.view_state
         else:

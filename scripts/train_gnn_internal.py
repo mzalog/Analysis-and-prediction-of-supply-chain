@@ -3,47 +3,30 @@ import numpy as np
 import sys
 import os
 from pathlib import Path
-import numpy as np
+import json
 
-# Add project root/src to sys.path
-current_dir = Path(__file__).resolve().parent
-src_path = current_dir.parent.parent.parent / "src"
-if str(src_path) not in sys.path:
-    sys.path.append(str(src_path))
+# Setup Path using helper
+try:
+    from paths import setup_path
+    project_root = setup_path()
+except ImportError:
+    # Fallback if running directly without paths.py in context? 
+    # But files are in same dir.
+    current_dir = Path(__file__).resolve().parent
+    sys.path.append(str(current_dir))
+    from paths import setup_path
+    project_root = setup_path()
 
 import torch
 import torch.nn as nn
 from torch_geometric.loader import DataLoader
-from supply_chain.gnn.dataset import SupplyChainGraphDataset
-from supply_chain.gnn.model import SupplyChainGNN
+from sklearn.metrics import average_precision_score
+
+# Adjusted Imports
+from supply_chain.data.dataset_gnn import SupplyChainGraphDataset
+from supply_chain.models.gnn import SupplyChainGNN
 from supply_chain.simulation.graph import GraphBuilder
 from supply_chain.config import REPORTS_DIR
-import pandas as pd
-import json
-
-from torch.utils.data import WeightedRandomSampler
-import numpy as np
-import sys
-import os
-from pathlib import Path
-import numpy as np
-from sklearn.metrics import average_precision_score, precision_recall_curve, auc
-
-# Add project root/src to sys.path
-current_dir = Path(__file__).resolve().parent
-src_path = current_dir.parent.parent.parent / "src"
-if str(src_path) not in sys.path:
-    sys.path.append(str(src_path))
-
-import torch
-import torch.nn as nn
-from torch_geometric.loader import DataLoader
-from supply_chain.gnn.dataset import SupplyChainGraphDataset
-from supply_chain.gnn.model import SupplyChainGNN
-from supply_chain.simulation.graph import GraphBuilder
-from supply_chain.config import REPORTS_DIR
-import pandas as pd
-import json
 
 def train_gnn():
     print("Starting GNN Training Pipeline (Refined Strategy)...")
@@ -52,7 +35,6 @@ def train_gnn():
     print(f"   Using Device: {device}")
     
     # 1. Load Data
-    project_root = Path(__file__).resolve().parent.parent.parent.parent
     data_dir = project_root / "data" / "raw"
     
     print(f"   Loading Episodes from: {data_dir}")
@@ -86,20 +68,15 @@ def train_gnn():
         print(f"     Ep {i}: Samples={len(y_ep)}, Mean Risk={mean_r:.3f}, High Risk(>0.8)={high_r:.1f}%")
 
     # --- 2. Stratified Episode Split ---
-    # Sort episodes by their "Risk Content" (mean risk) to ensure balanced splits
     ep_stats = []
     for i, ep in enumerate(dataset.episodes):
-        # Sort by "High Risk Rate" (content in top 20% bucket)
-        # Since y is now percentile, >0.8 means strictly top 20% of risks in that snapshot.
         all_y = torch.cat([d.y for d in ep])
         ep_risk = (all_y > 0.8).float().mean().item()
         ep_stats.append((i, ep_risk))
         
-    # Sort by risk (High to Low)
     ep_stats.sort(key=lambda x: x[1], reverse=True)
     sorted_indices = [x[0] for x in ep_stats]
     
-    # Distribute: Train (0,1,2,3...), Test (take every 5th?), Val (others)
     train_eps, val_eps, test_eps = [], [], []
     for k, idx in enumerate(sorted_indices):
         if k % 5 == 3: val_eps.append(dataset.episodes[idx])
@@ -130,7 +107,6 @@ def train_gnn():
     x_std = torch.where(x_std < 1e-5, torch.ones_like(x_std)*1e-5, x_std)
     e_std = torch.where(e_std < 1e-5, torch.ones_like(e_std)*1e-5, e_std)
     
-    # Mask Categorical Columns (0, 6, 12) - Type Feature repeats every 6
     cat_indices = [0, 6, 12]
     for idx in cat_indices:
         x_mean[idx] = 0.0
@@ -155,21 +131,15 @@ def train_gnn():
     # --- 4. Balancing Strategy: Weighted Sampler Only ---
     train_y = torch.cat([d.y for d in train_data]).view(-1)
     
-    # Simplified: No pos_weight (conflict with sampler). 
-    # Rely on Sampler to feed balanced batches.
     print(f"Balancing: Using WeightedRandomSampler (Deciles).")
     
-    # Bins: 5 fixed intervals [0-0.2, 0.2-0.4, ..., 0.8-1.0]
     counts = torch.histc(train_y, bins=5, min=0, max=1)
     print(f"Train Distribution (5 bins): {counts.int().tolist()}")
     
-    # Weights inverse to bin frequency
     bin_weights = 1.0 / (counts + 1.0) 
     sample_weights = []
     
     for data in train_data:
-        # Use P95 risk in snapshot to determine bucket (more robust than max)
-        # If snapshot has ANY high risk, we want to see it. Max is fine for "Risk Detection".
         r = data.y.max().item()
         b_idx = min(int(r * 5), 4)
         sample_weights.append(bin_weights[b_idx].item())
@@ -184,7 +154,6 @@ def train_gnn():
     model = SupplyChainGNN(in_channels=18, hidden_channels=64, out_channels=1).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=0.005)
     
-    # Standard Loss (Sampler handles balance)
     criterion = nn.BCEWithLogitsLoss() 
     
     # 6. Training Loop
@@ -206,7 +175,6 @@ def train_gnn():
         targets = np.array(targets).flatten()
         preds = np.array(preds).flatten()
         try:
-            # PR-AUC for binary classification at threshold
             ap = average_precision_score((targets > threshold).astype(int), preds)
         except:
             ap = 0.0
@@ -238,7 +206,6 @@ def train_gnn():
         if epoch % 5 == 0:
             print(f"     Epoch {epoch+1}/{epochs} | Loss: {train_loss:.4f} | Val AP@0.5: {val_auc_05:.4f} | AP@0.8: {val_auc_08:.4f}")
             
-        # Save on improving AP@0.8 (Focus on High Risk)
         if val_auc_08 > best_val_auc:
             best_val_auc = val_auc_08
             torch.save(model.state_dict(), output_dir / "supply_chain_gnn.pth")

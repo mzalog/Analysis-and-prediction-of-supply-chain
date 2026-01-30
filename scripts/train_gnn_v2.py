@@ -6,13 +6,19 @@ import numpy as np
 from pathlib import Path
 import json
 
-project_root = Path(__file__).resolve().parent
-sys.path.append(str(project_root))
-sys.path.append(str(project_root / "src"))
+# Setup Path
+try:
+    from paths import setup_path
+    project_root = setup_path()
+except ImportError:
+    current_dir = Path(__file__).resolve().parent
+    sys.path.append(str(current_dir))
+    from paths import setup_path
+    project_root = setup_path()
 
 from supply_chain.simulation.graph import GraphBuilder
-from supply_chain.gnn.dataset_v2 import SupplyChainGraphDatasetV2
-from supply_chain.gnn.model import SupplyChainGNN
+from supply_chain.data.dataset_gnn_v2 import SupplyChainGraphDatasetV2
+from supply_chain.models.gnn import SupplyChainGNN
 from supply_chain.config import DATA_RAW_DIR
 
 def train_v2():
@@ -43,7 +49,6 @@ def train_v2():
     edge_mean = all_edge.mean(dim=0)
     edge_std = all_edge.std(dim=0) + 1e-6
     
-    # For Y, we might want stats for information, but usually we predict Log-Delay directly.
     y_mean = all_y.mean(dim=0)
     y_std = all_y.std(dim=0)
     
@@ -56,7 +61,10 @@ def train_v2():
         "edge_mean": edge_mean.tolist(), "edge_std": edge_std.tolist(),
         "y_log_mean": y_mean.item(), "y_log_std": y_std.item()
     }
-    with open("models/gnn_v2_scaler.json", "w") as f:
+    
+    models_dir = project_root / "models"
+    models_dir.mkdir(parents=True, exist_ok=True)
+    with open(models_dir / "gnn_v2_scaler.json", "w") as f:
         json.dump(scaler, f)
 
     # 3. Model Setup
@@ -114,9 +122,9 @@ def train_v2():
         
         if avg_loss < best_loss:
             best_loss = avg_loss
-            torch.save(model.state_dict(), "models/supply_chain_gnn_v2.pth")
+            torch.save(model.state_dict(), models_dir / "supply_chain_gnn_v2.pth")
             
-    print("Training Complete (V2). Model saved to models/supply_chain_gnn_v2.pth")
+    print(f"Training Complete (V2). Model saved to {models_dir / 'supply_chain_gnn_v2.pth'}")
 
 if __name__ == "__main__":
     train_v2()
