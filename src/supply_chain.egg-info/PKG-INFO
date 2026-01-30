@@ -1,0 +1,22 @@
+Metadata-Version: 2.4
+Name: supply_chain
+Version: 0.1.0
+Summary: Big Data Supply Chain Analytics
+Requires-Python: >=3.9
+Requires-Dist: pandas>=2.2.0
+Requires-Dist: numpy>=1.26.0
+Requires-Dist: matplotlib>=3.8.0
+Requires-Dist: seaborn>=0.13.0
+Requires-Dist: scikit-learn>=1.5.0
+Requires-Dist: pyarrow>=12.0.0
+Requires-Dist: pandera>=0.18.0
+Requires-Dist: networkx>=3.0.0
+Requires-Dist: torch>=2.0.0
+Requires-Dist: torch-geometric>=2.7.0
+Requires-Dist: tqdm>=4.65.0
+Requires-Dist: streamlit>=1.52.2
+Requires-Dist: pydeck>=0.8.0
+Provides-Extra: dev
+Requires-Dist: ruff>=0.1.0; extra == "dev"
+Requires-Dist: pytest>=7.4.0; extra == "dev"
+Requires-Dist: pytest-cov>=4.1.0; extra == "dev"
